@@ -389,11 +389,43 @@ const SYM_RE = /^[A-Z0-9_]{2,20}$/;   // format symbole — source unique (setSy
 const TEXT_MAX = 500, PTS_MAX = 3000; // bornes des tracés — source unique (création, validation, chargement)
 const fetchJson = (url, ms = 10000) => fetch(url, { signal: AbortSignal.timeout(ms) }).then(r => r.json());
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
-const TFSEC = { '1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'8h':28800,'12h':43200,'1d':86400,'3d':259200,'1w':604800,'1M':2592000 };
-const TFS = Object.keys(TFSEC);
-const barEnd = t0 => {   // clôture réelle de la bougie ouverte à t0 (mois calendaire pour 1M)
-  if (tf === '1M') { const d = new Date(t0 * 1000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000; }
-  return t0 + (TFSEC[tf] || 60);
+/* table des TF : sec = durée (extrapolation/chrono), src = intervalle Binance NATIF servant de
+   source, fact = facteur d'agrégation. src 'agg' = construit en direct depuis les aggTrades
+   (secondes : historique court par nature — timing, pas cartographie). */
+const TFDEF = {
+  '3s':  { sec: 3,        src: 'agg' }, '15s': { sec: 15,     src: 'agg' },
+  '30s': { sec: 30,       src: 'agg' }, '45s': { sec: 45,     src: 'agg' },
+  '1m':  { sec: 60,       src: '1m',  fact: 1 }, '2m':  { sec: 120,      src: '1m',  fact: 2 },
+  '3m':  { sec: 180,      src: '3m',  fact: 1 }, '4m':  { sec: 240,      src: '1m',  fact: 4 },
+  '5m':  { sec: 300,      src: '5m',  fact: 1 }, '8m':  { sec: 480,      src: '1m',  fact: 8 },
+  '15m': { sec: 900,      src: '15m', fact: 1 }, '30m': { sec: 1800,     src: '30m', fact: 1 },
+  '1h':  { sec: 3600,     src: '1h',  fact: 1 }, '2h':  { sec: 7200,     src: '2h',  fact: 1 },
+  '4h':  { sec: 14400,    src: '4h',  fact: 1 }, '8h':  { sec: 28800,    src: '8h',  fact: 1 },
+  '1d':  { sec: 86400,    src: '1d',  fact: 1 }, '2d':  { sec: 172800,   src: '1d',  fact: 2 },
+  '1w':  { sec: 604800,   src: '1w',  fact: 1 }, '2w':  { sec: 1209600,  src: '1w',  fact: 2 },
+  '1M':  { sec: 2592000,  src: '1M',  fact: 1 }, '2M':  { sec: 5184000,  src: '1M',  fact: 2 },
+  '4M':  { sec: 10368000, src: '1M',  fact: 4 },
+};
+const TFSEC = Object.fromEntries(Object.entries(TFDEF).map(([k, v]) => [k, v.sec]));   // compat existant
+const TFS = Object.keys(TFDEF);
+const tfDef = () => TFDEF[tf] || TFDEF['1m'];
+const isSecTf = () => tfDef().src === 'agg';
+const W0 = 345600;   // lundi 5 janv. 1970 00:00 UTC : alignement hebdomadaire Binance
+function bucketStart(t) {   // ouverture du seau agrégé contenant l'instant t
+  const d = tfDef();
+  if (d.src === '1M') {
+    const dt = new Date(t * 1000);
+    const m = dt.getUTCFullYear() * 12 + dt.getUTCMonth();
+    const m0 = Math.floor(m / d.fact) * d.fact;
+    return Date.UTC(Math.floor(m0 / 12), m0 % 12, 1) / 1000;
+  }
+  if (d.src === '1w') return W0 + Math.floor((t - W0) / d.sec) * d.sec;
+  return Math.floor(t / d.sec) * d.sec;
+}
+const barEnd = t0 => {   // clôture réelle de la bougie ouverte à t0 (mois calendaires pour 1M/2M/4M)
+  const d = tfDef();
+  if (d.src === '1M') { const dt = new Date(t0 * 1000); return Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth() + d.fact, 1) / 1000; }
+  return t0 + d.sec;
 };
 const tfLabel = t => /[dw]$/.test(t) ? t.toUpperCase() : t;
 const SYMBOLS = [
@@ -542,6 +574,50 @@ function toast(msg) {
   setTimeout(() => t.style.opacity = 0, 3000);
 }
 const mapK = x => ({ time: x[0] / 1000, open: +x[1], high: +x[2], low: +x[3], close: +x[4], volume: +x[5] });
+const AGGT = 'https://fapi.binance.com/fapi/v1/aggTrades';
+function rollup(bars) {   // agrège des bougies SOURCE en seaux du TF courant (fact > 1)
+  const d = tfDef();
+  if ((d.fact || 1) === 1) return bars;
+  const out = [];
+  for (const b of bars) {
+    const bt = bucketStart(b.time);
+    const last = out[out.length - 1];
+    if (last && last.time === bt) {
+      if (b.high > last.high) last.high = b.high;
+      if (b.low < last.low) last.low = b.low;
+      last.close = b.close; last.volume += b.volume;
+    } else out.push({ time: bt, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+  }
+  return out;
+}
+/* bougies du TF courant : fetch l'intervalle SOURCE puis agrège ; passe l'objet {code,msg} inchangé */
+async function fetchK(extra, limitAgg, ms) {
+  const d = tfDef();
+  const lim = Math.min(1500, limitAgg * (d.fact || 1));
+  const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${d.src}&limit=${lim}${extra}`, ms);
+  if (!Array.isArray(k)) return k;
+  return rollup(k.map(mapK));
+}
+function tradesToBars(trades) {   // TF secondes : seaux construits depuis les aggTrades
+  const out = [];
+  for (const t of trades) {
+    const price = +t.p, q = +t.q, bt = bucketStart(t.T / 1000);
+    const last = out[out.length - 1];
+    if (last && last.time === bt) {
+      if (price > last.high) last.high = price;
+      if (price < last.low) last.low = price;
+      last.close = price; last.volume += q;
+    } else out.push({ time: bt, open: price, high: price, low: price, close: price, volume: q });
+  }
+  return out;
+}
+let lastTradeMs = 0;   // curseur du flux aggTrades (TF secondes)
+function applyTrade(price, q, tSec) {   // un trade → le seau courant (créé au besoin)
+  const last = candles[candles.length - 1];
+  const bt = bucketStart(tSec);
+  if (!last || bt > last.time) applyBar({ time: bt, open: price, high: price, low: price, close: price, volume: q });
+  else if (bt === last.time) applyBar({ time: bt, open: last.open, high: Math.max(last.high, price), low: Math.min(last.low, price), close: price, volume: last.volume + q });
+}
 const volOf = b => ({ time: b.time, value: b.volume, color: volColor(b.open, b.close) });
 
 /* pipeline commun : (re)pose les deux séries + indicateur ; fusionne une bougie entrante */
@@ -573,7 +649,8 @@ function applyBar(bar) {
   const last = candles[candles.length - 1];
   let isNew = false;
   if (bar.time > last.time) {
-    if (bar.time > barEnd(last.time)) { fillGap(); return; }   // trou (veille, coupure) → rattrapage REST
+    // trou (veille, coupure) → rattrapage REST ; en secondes, un trou = absence de trades : on appende
+    if (bar.time > barEnd(last.time) && !isSecTf()) { fillGap(); return; }
     candles.push(bar); isNew = true;
     if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); return; }
   } else if (bar.time === last.time) candles[candles.length - 1] = bar;
@@ -589,14 +666,16 @@ function applyBar(bar) {
    .length — un futur appelant naïf le concaténerait dans candles. */
 const FETCH_ERR = Symbol('fetch-err');
 async function fetchOlder(limit, ms) {
+  if (isSecTf()) return null;   // secondes : pas d'historique profond
   const seq = loadSeq, endT = candles[0].time * 1000 - 1;
   let k;
-  try { k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=${limit}&endTime=${endT}`, ms); }
+  try { k = await fetchK(`&endTime=${endT}`, limit, ms); }
   catch { return FETCH_ERR; }
   if (!Array.isArray(k)) return FETCH_ERR;
   if (seq !== loadSeq || !ctxFresh() || !candles.length || candles[0].time * 1000 - 1 !== endT) return null;
+  if ((tfDef().fact || 1) > 1 && k.length) k.shift();   // le seau le plus ancien peut être partiel (source tronquée)
   const first = candles[0].time;
-  return k.map(mapK).filter(b => b.time < first);
+  return k.filter(b => b.time < first);
 }
 
 /* rattrape les bougies manquantes entre la dernière connue et maintenant */
@@ -607,24 +686,23 @@ function fillGapSoon() {   // throttle : au plus une tentative toutes les 2 s (a
   lastGapReq = n; fillGap();
 }
 async function fillGap() {
-  if (gapFilling || ctxBusy() || !candles.length) return;
+  if (gapFilling || ctxBusy() || isSecTf() || !candles.length) return;   // secondes : rien à rattraper côté klines
   gapFilling = true;
   const seq = loadSeq;
   try {
     for (let round = 0; round < 20; round++) {
-      const from = candles[candles.length - 1].time * 1000 + 1;
-      const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&startTime=${from}&limit=1000`);
+      const from = candles[candles.length - 1].time * 1000;   // début du seau courant : le rollup le reconstruit ENTIER
+      const k = await fetchK(`&startTime=${from}`, 1000);
       if (seq !== loadSeq || replay || !Array.isArray(k) || !k.length) break;
-      k.map(mapK).forEach(b => {
-        if (b.time > candles[candles.length - 1].time) {
-          candles.push(b);
-          series.update(b); volSeries.update(volOf(b));
-        }
+      k.forEach(b => {
+        const last = candles[candles.length - 1];
+        if (b.time === last.time) { candles[candles.length - 1] = b; series.update(b); volSeries.update(volOf(b)); }
+        else if (b.time > last.time) { candles.push(b); series.update(b); volSeries.update(volOf(b)); }
       });
       if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); }
       else computeInd();
       refreshTop(); invalidate();
-      if (k.length < 1000) break;
+      if (k.length < 500) break;
     }
   } catch {} finally { gapFilling = false; }
 }
@@ -654,10 +732,17 @@ async function load(keepZoom = false, attempt = 0) {
       Math.min(30000, 5000 * 2 ** attempt));
   };
   try {
-    const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=500`);
+    let k;
+    if (isSecTf()) {   // secondes : construit depuis les derniers aggTrades (historique court par nature)
+      const tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
+      if (Array.isArray(tr) && tr.length) { lastTradeMs = tr[tr.length - 1].T; k = tradesToBars(tr); }
+      else k = tr;
+    } else k = await fetchK('', 500);
     if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
     if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); retry(); return; }
-    candles = k.map(mapK);
+    candles = k;
+    if (isSecTf()) oldestDone = true;   // pas de scroll-back en secondes
+    bucketVols = new Map();
     dataCtx = symbol + '|' + tf;
     setPrecision(candles.at(-1).close);
     if (keepRange && keepRange.from != null) {
@@ -689,6 +774,7 @@ async function load(keepZoom = false, attempt = 0) {
 }
 
 let pollTimer = null, reconnectTimer = null, staleTimer = null, lastMsgAt = 0;
+let bucketVols = new Map();   // volumes des bougies source du seau courant (WS kline agrégé)
 function stopWs() {
   if (ws) { try { ws.close(); } catch {} ws = null; }   // pas de reconnexion : loadSeq a déjà tourné
   clearInterval(pollTimer); pollTimer = null;
@@ -712,11 +798,14 @@ function startPoll(seq) {
     if (++ticks % 30 === 0) syncClock();                 // resynchronise l'horloge toutes les ~60 s
     inFlight = true;
     try {
-      const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=2`, 8000);
+      let k;
+      if (isSecTf()) k = await fetchJson(`${AGGT}?symbol=${symbol}&startTime=${lastTradeMs + 1}&limit=1000`, 8000);
+      else k = await fetchK('', 2, 8000);
       if (seq !== loadSeq || replay || !candles.length) return;   // replay entré PENDANT le fetch : rien ne fuit
       if (!Array.isArray(k)) { backoff = 15; failed(); return; }   // {code,msg} persistant = flux mort
       fails = 0; $('dot').classList.add('live');
-      k.forEach(x => applyBar(mapK(x)));
+      if (isSecTf()) for (const t of k) { applyTrade(+t.p, +t.q, t.T / 1000); lastTradeMs = t.T; }
+      else k.forEach(x => applyBar(x));
     } catch { backoff = 5; failed(); }
     finally { inFlight = false; }
   }, 2000);
@@ -725,7 +814,8 @@ function startPoll(seq) {
 function startWs(attempt = 0) {
   const s = symbol.toLowerCase(), seq = loadSeq;
   let gotMsg = false, muted = false;
-  ws = new WebSocket(`${WSS}?streams=${s}@aggTrade/${s}@kline_${tf}`);
+  const srcInt = isSecTf() ? '1m' : tfDef().src;   // on s'abonne à l'intervalle SOURCE (secondes : aggTrade seul compte)
+  ws = new WebSocket(`${WSS}?streams=${s}@aggTrade/${s}@kline_${srcInt}`);
   const watchdog = setTimeout(() => {          // WS ouvert mais muet → bascule en polling REST
     if (seq === loadSeq && !gotMsg) {
       muted = true;
@@ -763,17 +853,34 @@ function startWs(attempt = 0) {
       if (replay || !candles.length) return;
       if (stream.endsWith('aggTrade')) {
         const p = +d.p, tt = d.T / 1000, last = candles[candles.length - 1];
+        if (isSecTf()) { applyTrade(p, +d.q, tt); lastTradeMs = d.T; }
         // borne haute : un trade de la bougie SUIVANTE ne doit jamais réécrire la bougie clôturée
-        if (tt >= last.time && tt < barEnd(last.time)) {
+        else if (tt >= last.time && tt < barEnd(last.time)) {
           last.close = p;
           if (p > last.high) last.high = p;
           if (p < last.low) last.low = p;
           series.update(last);
           refreshTop(); invalidate();
         } else if (tt >= barEnd(last.time)) fillGapSoon();   // kline muet mais trades vivants → rattrapage REST
-      } else {
+      } else if (!isSecTf()) {
         const k = d.k;
-        applyBar({ time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v });
+        const sb = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v };
+        const df = tfDef();
+        if ((df.fact || 1) === 1) applyBar(sb);
+        else {   // TF agrégé : la bougie source alimente le seau courant
+          const bt = bucketStart(sb.time), last = candles[candles.length - 1];
+          if (!last) return;
+          if (bt > last.time) {
+            bucketVols = new Map([[sb.time, sb.volume]]);
+            applyBar({ time: bt, open: sb.open, high: sb.high, low: sb.low, close: sb.close, volume: sb.volume });
+          } else if (bt === last.time) {
+            /* volume du seau = somme des bougies source connues ; léger sous-comptage possible
+               juste après un load mi-seau (corrigé par le prochain poll/fillGap) */
+            bucketVols.set(sb.time, sb.volume);
+            let vol = 0; for (const v of bucketVols.values()) vol += v;
+            applyBar({ time: bt, open: last.open, high: Math.max(last.high, sb.high), low: Math.min(last.low, sb.low), close: sb.close, volume: Math.max(vol, last.volume) });
+          }
+        }
       }
     } catch {}
   };
@@ -837,7 +944,7 @@ async function setSymbol(v) {
   if (!SYM_RE.test(v)) { toast(`Symbole invalide : ${v}`); return; }   // défense en profondeur (URLs)
   const req = ++symSeq;                          // le dernier clic gagne, pas la dernière réponse
   try {                                          // valider AVANT de toucher l'état
-    const k = await fetchJson(`${REST}?symbol=${encodeURIComponent(v)}&interval=${tf}&limit=1`, 8000);
+    const k = await fetchJson(`${REST}?symbol=${encodeURIComponent(v)}&interval=1m&limit=1`, 8000);
     if (req !== symSeq) return;
     if (!Array.isArray(k) || !k.length) { toast(`Symbole invalide : ${v}`); return; }
   } catch { if (req === symSeq) toast('Réseau : symbole non vérifié, réessaie'); return; }
@@ -1059,8 +1166,8 @@ function saveDrawings() {
 const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
 const tfOk = t => typeof t === 'string' && Object.hasOwn(TFSEC, t);   // TF de zone = 1m → 1M, aligné sur propTf
-/* nomenclature zones (préfixe, style doctrine) : m1…m30, H1…H12, D1, D3, W1, M1 (mensuel) */
-const zLabel = t => (t.endsWith('m') ? 'm' : t.slice(-1).toUpperCase()) + t.slice(0, -1);
+/* nomenclature zones (préfixe, style doctrine) : s3…s45, m1…m30, H1…H8, D1, D2, W1, W2, M1…M4 */
+const zLabel = t => (t.endsWith('s') ? 's' : t.endsWith('m') ? 'm' : t.slice(-1).toUpperCase()) + t.slice(0, -1);
 function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
