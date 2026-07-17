@@ -81,8 +81,9 @@
   #tools {
     width: 50px; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0;
     background: linear-gradient(90deg, #0d0c08, #070603); border-right: 1px solid var(--border);
-    z-index: 20;
+    z-index: 20; overflow-y: auto; scrollbar-width: none;   /* petite fenêtre : la colonne défile */
   }
+  #tools::-webkit-scrollbar { display: none; }
   .tool {
     position: relative; width: 36px; height: 29px; flex: none;
     display: flex; align-items: center; justify-content: center;
@@ -398,6 +399,12 @@ const SYMBOLS = [
 
 const MAX_BARS = 50000;   // plafond mémoire unique : applyBar, fillGap et scroll-back historique
 let symbol = 'BTCUSDT', tf = '1m', prec = 2;
+try {   // dernier contexte : on rouvre là où on travaillait, pas en 1m/BTC
+  const st = localStorage.getItem('orion-tf');
+  if (TFSEC[st]) tf = st;
+  const sy = localStorage.getItem('orion-sym');
+  if (sy && /^[A-Z0-9_]{2,20}$/.test(sy)) symbol = sy;
+} catch {}
 let candles = [];
 let ws = null, loadSeq = 0;
 let replay = null;
@@ -519,7 +526,7 @@ function refreshTop() {
   const c = candles[candles.length - 1];
   if (!c) return;
   lastPriceTxt = fmt(c.close);   // appliqué au DOM dans le rAF (chemin chaud : 1 écriture/trade sinon)
-  legend(c);
+  if (!hoverBar) legend(c);      // ne pas écraser la légende d'une bougie survolée au crosshair
 }
 function applyBar(bar) {
   const last = candles[candles.length - 1];
@@ -549,7 +556,7 @@ async function fillGap() {
   try {
     for (let round = 0; round < 20; round++) {
       const from = candles[candles.length - 1].time * 1000 + 1;
-      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&startTime=${from}&limit=1000`)).json();
+      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&startTime=${from}&limit=1000`, { signal: AbortSignal.timeout(10000) })).json();
       if (seq !== loadSeq || replay || !Array.isArray(k) || !k.length) break;
       k.map(mapK).forEach(b => {
         if (b.time > candles[candles.length - 1].time) {
@@ -586,7 +593,7 @@ async function load(keepZoom = false, attempt = 0) {
       Math.min(30000, 5000 * 2 ** attempt));
   };
   try {
-    const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500`);
+    const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500`, { signal: AbortSignal.timeout(10000) });
     const k = await r.json();
     if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
     if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); retry(); return; }
@@ -613,7 +620,7 @@ function stopWs() {
 function startPoll(seq) {
   if (pollTimer || seq !== loadSeq) return;
   $('dot').classList.add('live');
-  const syncClock = () => fetch('https://fapi.binance.com/fapi/v1/time').then(r => r.json())
+  const syncClock = () => fetch('https://fapi.binance.com/fapi/v1/time', { signal: AbortSignal.timeout(5000) }).then(r => r.json())
     .then(j => { if (j.serverTime) clockOff = j.serverTime - Date.now(); }).catch(() => {});
   syncClock();
   let backoff = 0, ticks = 0, inFlight = false, fails = 0;
@@ -624,9 +631,13 @@ function startPoll(seq) {
     if (++ticks % 30 === 0) syncClock();                 // resynchronise l'horloge toutes les ~60 s
     inFlight = true;
     try {
-      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=2`)).json();
+      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=2`, { signal: AbortSignal.timeout(8000) })).json();
       if (seq !== loadSeq || !candles.length) return;
-      if (!Array.isArray(k)) { backoff = 15; return; }   // {code,msg} → pause 30 s
+      if (!Array.isArray(k)) {   // {code,msg} → pause 30 s ; persistant = flux mort, dot éteint
+        backoff = 15;
+        if (++fails >= 3 && seq === loadSeq) $('dot').classList.remove('live');
+        return;
+      }
       fails = 0; $('dot').classList.add('live');
       k.forEach(x => applyBar(mapK(x)));
     } catch { backoff = 5; if (++fails >= 3 && seq === loadSeq) $('dot').classList.remove('live'); }
@@ -658,8 +669,8 @@ function startWs(attempt = 0) {
   ws.onopen = () => $('dot').classList.add('live');
   ws.onclose = () => {
     clearTimeout(watchdog);
+    if (muted || seq !== loadSeq) return;   // AVANT de toucher le dot : un vieux WS ne doit pas l'éteindre
     if (!pollTimer) $('dot').classList.remove('live');
-    if (muted || seq !== loadSeq) return;
     if (!gotMsg && attempt >= 1) { startPoll(seq); return; }   // 2 connexions mortes → polling
     reconnectTimer = setTimeout(() => {
       if (seq === loadSeq && !pollTimer) startWs(gotMsg ? 0 : attempt + 1);
@@ -712,10 +723,12 @@ $('chartwrap').addEventListener('mousemove', e => {
   if (replay && replay.picking) curtainX = mpos(e).x;
 });
 $('chartwrap').addEventListener('mouseleave', () => { curtainX = null; });
+let hoverBar = false;   // crosshair posé sur une bougie → la légende live ne doit pas l'écraser
 chart.subscribeCrosshairMove(p => {
   const bar = p.seriesData.get(series);
   const v = p.seriesData.get(volSeries);
   const av = p.seriesData.get(atrSeries);
+  hoverBar = !!bar;
   if (bar) legend(bar, v && v.value, av ? av.value : null);
   else legend(curBar());
 });
@@ -728,6 +741,7 @@ TFS.forEach(t => {
   b.onclick = () => {
     if (replay) exitReplay(false);
     tf = t;
+    try { localStorage.setItem('orion-tf', tf); } catch {}
     document.querySelectorAll('.tfbtn').forEach(x => x.classList.toggle('on', x === b));
     resetTransient();   // les tracés (ancrés en temps) survivent au changement de TF
     load();
@@ -743,12 +757,13 @@ async function setSymbol(v) {
   if (!/^[A-Z0-9_]{2,20}$/.test(v)) { toast(`Symbole invalide : ${v}`); return; }   // défense en profondeur (URLs)
   const req = ++symSeq;                          // le dernier clic gagne, pas la dernière réponse
   try {                                          // valider AVANT de toucher l'état
-    const k = await (await fetch(`${REST}?symbol=${encodeURIComponent(v)}&interval=${tf}&limit=1`)).json();
+    const k = await (await fetch(`${REST}?symbol=${encodeURIComponent(v)}&interval=${tf}&limit=1`, { signal: AbortSignal.timeout(8000) })).json();
     if (req !== symSeq) return;
     if (!Array.isArray(k) || !k.length) { toast(`Symbole invalide : ${v}`); return; }
   } catch { if (req === symSeq) toast('Réseau : symbole non vérifié, réessaie'); return; }
   if (replay) exitReplay(false);
   symbol = v;
+  try { localStorage.setItem('orion-sym', symbol); } catch {}
   $('symBtn').textContent = v + ' ▾';
   loadDrawings();                                // tracés propres à chaque symbole (localStorage)
   load(true);                                    // même zoom : on compare des paires au même cadrage
@@ -785,6 +800,7 @@ let replayLoading = false;
 async function enterReplay() {
   if (replay || replayLoading) return;
   if (!candles.length) { toast('Replay : données pas encore chargées'); return; }
+  if (loading || retryTimer) { toast('Replay : chargement en cours, réessaie'); return; }   // candles ≠ symbol/tf courants
   replayLoading = true;
   const seq = loadSeq;
   try {
@@ -792,9 +808,12 @@ async function enterReplay() {
        scroll est pickable, et l'entrée ne déplace pas la vue (mêmes données).
        On complète seulement si on en a peu (page fraîche = 500). */
     if (candles.length < 1500) {
-      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=1000&endTime=${candles[0].time * 1000 - 1}`)).json();
+      const endT = candles[0].time * 1000 - 1;
+      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=1000&endTime=${endT}`,
+        { signal: AbortSignal.timeout(10000) })).json();   // pas d'entrée replay gelée sur réseau suspendu
       if (seq !== loadSeq || replay) return;     // symbole/TF changé pendant le fetch
-      if (Array.isArray(k)) {
+      // garde anti-trou (même famille que le scroll-back) : la tête a pu bouger pendant l'await (cap-slice)
+      if (Array.isArray(k) && candles.length && candles[0].time * 1000 - 1 === endT) {
         const first = candles[0].time;
         const older = k.map(mapK).filter(b => b.time < first);
         if (older.length) candles = older.concat(candles);
@@ -806,6 +825,7 @@ async function enterReplay() {
     setAll(replay.data);
     $('replayBtn').classList.add('on');
     $('replaybar').hidden = false; $('hint').hidden = false;
+    $('dot').classList.remove('live'); lastPriceTxt = '—';   // topbar honnête : pas de « live » sur du passé
     select(null);
     legend(replay.data[replay.i]);
   } catch (e) { toast('Replay : ' + e.message); }
@@ -822,6 +842,7 @@ function pickAt(time) {
   const bars = Math.max(20, paneW() / (ts().options().barSpacing || 6));
   ts().setVisibleLogicalRange({ from: i - bars * .7, to: i + bars * .3 });
   legend(replay.data[i]);
+  if (sel != null && drawings[sel] && futureHidden(drawings[sel])) select(null);   // pas de propbar sur un tracé masqué
 }
 function rpStep() {
   if (!replay || replay.picking) return;
@@ -850,6 +871,7 @@ function rpPause() {
 }
 function exitReplay(reload = true) {
   rpPause(); replay = null; curtainX = null;
+  refreshTop();   // légende sans badge REPLAY + prix restauré, même si le load qui suit échoue
   $('replayBtn').classList.remove('on');
   $('replaybar').hidden = true; $('hint').hidden = true;
   if (!$('propbar').hidden) $('propbar').style.top = '12px';   // la propbar suit la replaybar
@@ -859,6 +881,9 @@ $('replayBtn').onclick = () => replay ? exitReplay() : enterReplay();
 $('rpExit').onclick = () => exitReplay();
 $('rpPlay').onclick = () => replay && (replay.playing ? rpPause() : rpPlay());
 $('rpStep').onclick = () => { rpPause(); rpStep(); };
+$('rpSpeed').addEventListener('change', () => {
+  if (replay && replay.playing) { rpPause(); rpPlay(); }   // nouvelle vitesse appliquée immédiatement
+});
 $('rpPick').onclick = () => {
   if (!replay) return;
   resetTool();   // un outil armé avalerait le clic de pick (stopPropagation) et créerait un tracé parasite
@@ -888,11 +913,11 @@ function sizeCv() {
 /* RO peut ne jamais délivrer selon l'environnement : triple ceinture
    (appel initial en bas de script, événement resize, auto-guérison dans render) */
 new ResizeObserver(sizeCv).observe(wrap);
-window.addEventListener('resize', sizeCv);
+window.addEventListener('resize', () => { cdCache.half = 0; sizeCv(); });   // re-mesure le cartouche (zoom navigateur)
 
 const paneW = () => ts().width();
 const paneH = () => cvH - ts().height();
-let dirty = true;
+let dirty = true, hudGlow = true, redrawStreak = 0;
 const invalidate = () => { dirty = true; };
 const PALETTE = ['#f0d478','#d9b64d','#f2984d','#e0564d','#e04da8','#9b59e0','#4d8fe0','#3ecfd4','#4dc06a','#f5f5f0'];
 const DASHES = { solid: [], dash: [8,5], dot: [2,3] };
@@ -944,16 +969,18 @@ function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
   if (d.width != null && !numOk(d.width)) return false;
+  if (d.kind != null && !Object.hasOwn(RKINDS, d.kind)) return false;   // pas de clé héritée (__proto__, toString…)
   switch (d.type) {
     case 'hline':   return numOk(d.price);
     case 'vline':   return numOk(d.t);
     case 'hray':    return numOk(d.t) && numOk(d.price);
-    case 'text':    return numOk(d.t) && numOk(d.price) && typeof d.text === 'string';
-    case 'brush':   return Array.isArray(d.pts) && d.pts.length > 0 && d.pts.every(ptOk);
+    case 'text':    return numOk(d.t) && numOk(d.price) && typeof d.text === 'string' && d.text.length <= 500;
+    case 'brush':   return Array.isArray(d.pts) && d.pts.length > 0 && d.pts.length <= 3000 && d.pts.every(ptOk);
     case 'channel': return ptOk(d.a) && ptOk(d.b) && numOk(d.off);
     case 'long': case 'short':
       return ptOk(d.a) && !!d.b && numOk(d.b.t) && numOk(d.target) && numOk(d.stop);
-    default:        return AB_TYPES.includes(d.type) && ptOk(d.a) && ptOk(d.b);
+    // 'measure' n'est jamais persisté légitimement (et hitTest ne sait pas le sélectionner)
+    default:        return AB_TYPES.includes(d.type) && d.type !== 'measure' && ptOk(d.a) && ptOk(d.b);
   }
 }
 function loadDrawings() {
@@ -971,11 +998,30 @@ const mpos = e => {
 };
 const lpt = e => {
   const m = mpos(e);
-  return { t: tOf(ts().coordinateToLogical(m.x)), price: series.coordinateToPrice(m.y) };
+  let t = tOf(ts().coordinateToLogical(m.x));
+  if (replay && t != null) {          // en replay : pas d'ancre au-delà de la tête de lecture
+    const h = curBar();               // (sinon le tracé naît futureHidden et « disparaît » au commit)
+    if (h && t > h.time) t = h.time;
+  }
+  return { t, price: series.coordinateToPrice(m.y) };
 };
-const xOf = t => { const l = lOf(t); return l != null ? ts().logicalToCoordinate(l) : null; };
+/* LWC v5 : logicalToCoordinate renvoie 0 pour un indice FRACTIONNAIRE (bug avéré) ;
+   or les ancres tombent ENTRE les bougies dès qu'on change de TF → entier + offset barSpacing */
+const xOf = t => {
+  const l = lOf(t);
+  if (l == null) return null;
+  const i = Math.round(l);
+  const x = ts().logicalToCoordinate(i);
+  return x == null ? null : x + (l - i) * ts().options().barSpacing;
+};
 const px = p => [xOf(p.t), p.price != null ? series.priceToCoordinate(p.price) : null];
-const dataNow = () => replay ? (replay.picking ? replay.data : replay.data.slice(0, replay.i + 1)) : candles;
+let dnRef = null, dnI = -1, dnCache = null;
+const dataNow = () => {   // mémoïsé : la tranche post-pick est allouée une fois par pas, pas par appel
+  if (!replay) return candles;
+  if (replay.picking) return replay.data;
+  if (dnRef !== replay || dnI !== replay.i) { dnRef = replay; dnI = replay.i; dnCache = replay.data.slice(0, replay.i + 1); }
+  return dnCache;
+};
 const curBar = () => { const a = dataNow(); return a[a.length - 1]; };
 const clone = o => structuredClone(o);
 const AB_TYPES = ['trend', 'ray', 'arrow', 'rect', 'ellipse', 'fib', 'measure'];
@@ -1043,16 +1089,19 @@ function deleteDrawing(i) {
   drawings.splice(i, 1); saveDrawings();
   if (sel === i) select(null);
   else if (sel != null && sel > i) sel--;
+  if (tool === 'cursor') wrap.style.cursor = '';   // pas de pointer orphelin après Suppr
 }
 $('magnetBtn').onclick = () => { magnet = !magnet; $('magnetBtn').classList.toggle('on', magnet); };
 $('eyeBtn').onclick = () => {
   showDraw = !showDraw;
   $('eyeBtn').classList.toggle('on', showDraw);
   $('eyeBtn').classList.toggle('hidden-draw', !showDraw);
-  if (!showDraw) select(null);
+  if (!showDraw) { select(null); if (tool === 'cursor') wrap.style.cursor = ''; }
   invalidate();
 };
 $('undoBtn').onclick = () => {
+  const last = drawings[drawings.length - 1];
+  if (last && futureHidden(last)) { toast('Dernier tracé masqué par le replay — rien annulé'); return; }
   drawings.pop(); saveDrawings(); select(null);
   if (tool !== 'cursor' && tool !== 'eraser') showPropbar(true);   // l'outil reste armé → la barre reste
 };
@@ -1092,7 +1141,9 @@ $('propDup').onclick = () => {
     const y = series.priceToCoordinate(c.price);
     if (y != null) c.price = series.coordinateToPrice(y + 20) ?? c.price;
   }
-  drawings.push(c); saveDrawings(); select(drawings.length - 1);
+  drawings.push(c); saveDrawings();
+  if (futureHidden(c)) { toast('Copie au-delà de la tête de lecture — masquée'); select(null); }
+  else select(drawings.length - 1);
 };
 $('propDel').onclick = () => { if (sel != null) deleteDrawing(sel); };
 
@@ -1118,8 +1169,7 @@ $('propKind').addEventListener('change', e => {
     else delete drawings[sel].kind;
     saveDrawings();
   } else {
-    rectKind = v;
-    if (v) setProp('color', RKINDS[v].color);   // couleur préréglée du type, modifiable ensuite
+    rectKind = v;   // la couleur préréglée s'applique au rect créé, sans polluer defaultStyle (les autres outils gardent leur couleur)
   }
   syncPropbar();
 });
@@ -1182,6 +1232,7 @@ wrap.addEventListener('mousedown', e => {
   if (temp && temp.type === 'channel' && temp.phase === 2) {   // 3e clic : valide la parallèle
     delete temp.phase;
     const d = temp; temp = null;
+    if (d.a.t === d.b.t && d.a.price === d.b.price) { resetTool(); invalidate(); return; }   // canal dégénéré (2 clics sur place)
     commit(d);
     return;
   }
@@ -1202,7 +1253,7 @@ wrap.addEventListener('mousedown', e => {
   if (tool === 'long' || tool === 'short') { temp = { type: tool, a: p, b: { t: p.t }, target: p.price, stop: p.price, ...st }; return; }
   if (AB_TYPES.includes(tool)) {
     temp = { type: tool, a: p, b: p, ...st };
-    if (tool === 'rect' && rectKind) temp.kind = rectKind;
+    if (tool === 'rect' && rectKind) { temp.kind = rectKind; temp.color = RKINDS[rectKind].color; }
   }
 }, true);
 document.addEventListener('mousemove', e => {
@@ -1380,7 +1431,9 @@ wrap.addEventListener('contextmenu', e => {
 });
 wrap.addEventListener('mousedown', e => {
   if (tool !== 'cursor' || e.button !== 0 || !showDraw || uiGuard(e)) return;
+  if (replay && replay.picking) return;         // le clic de pick doit atteindre LWC, pas la sélection
   const m = mpos(e);
+  if (m.x > paneW() || m.y > paneH()) return;   // clic sur un axe → comportement natif LWC
   const ht = hitTest(m.x, m.y);
   if (ht) {
     e.preventDefault(); e.stopPropagation();
@@ -1442,7 +1495,9 @@ document.addEventListener('mousemove', e => {
     return;
   }
   if (tool === 'cursor' && showDraw && e.target.closest('#chartwrap') && !uiGuard(e)) {
+    if (replay && replay.picking) return;
     const m = mpos(e);
+    if (m.x > paneW() || m.y > paneH()) { wrap.style.cursor = ''; return; }   // pas de pointer sur les axes
     hoverX = m.x; hoverY = m.y;
     if (!hoverQueued) {   // hit-test complet (coûteux avec de longs pinceaux) : au plus 1×/frame
       hoverQueued = true;
@@ -1560,7 +1615,7 @@ function drawOne(d, isSel) {
         ctx.strokeRect(xa + .5, ya + .5, w - 1, h - 1);
         const cr = Math.min(12, w / 3, h / 3);
         ctx.strokeStyle = col; ctx.lineWidth = d.width || 1.5;
-        ctx.shadowColor = col; ctx.shadowBlur = isSel ? 10 : 6;
+        ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 10 : 6) : 0;
         ctx.beginPath();
         ctx.moveTo(xa, ya + cr); ctx.lineTo(xa, ya); ctx.lineTo(xa + cr, ya);
         ctx.moveTo(xb - cr, ya); ctx.lineTo(xb, ya); ctx.lineTo(xb, ya + cr);
@@ -1574,7 +1629,7 @@ function drawOne(d, isSel) {
           ctx.fillStyle = hexToRgba(col, .92);
           ctx.font = `600 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;
           ctx.letterSpacing = (fs * .22).toFixed(1) + 'px';
-          ctx.shadowColor = col; ctx.shadowBlur = fs * .45;
+          ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? fs * .45 : 0;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           ctx.fillText(k.label, xa + w / 2, ya + h / 2);
           ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
@@ -1622,13 +1677,15 @@ function drawOne(d, isSel) {
   }
 }
 /* --- chrono de clôture de bougie (sous le prix, comme TV) --- */
+const cdNext = { base: null, c: 0 };
 function barCloseTs() {
   if (!candles.length) return null;
+  const base = candles[candles.length - 1].time;
   const now = (Date.now() + clockOff) / 1000;
-  // ancré sur l'ouverture réelle, roule immédiatement sur l'intervalle suivant à l'échéance
-  let c = barEnd(candles[candles.length - 1].time);
-  for (let g = 0; c <= now && g < 100000; g++) c = barEnd(c);
-  return c;
+  // ancré sur l'ouverture réelle ; mémoïsé : on ne ré-avance que depuis la dernière échéance connue
+  if (cdNext.base !== base) { cdNext.base = base; cdNext.c = barEnd(base); }
+  for (let g = 0; cdNext.c <= now && g < 100000; g++) cdNext.c = barEnd(cdNext.c);
+  return cdNext.c;
 }
 /* refs et cache : aucune lecture/écriture DOM superflue à 60 fps */
 const cdEl = $('countdown'), cdP = cdEl.querySelector('.cdP'), cdT = cdEl.querySelector('.cdT');
@@ -1672,9 +1729,15 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
   if (legendHTML !== legendShown) { $('legend').innerHTML = legendShown = legendHTML; }
   if (lastPriceTxt !== lastPriceShown) { $('lastPrice').textContent = lastPriceShown = lastPriceTxt; }
   /* measure est statique une fois posée (ancrée t/prix, la vue invalide déjà) :
-     plus de redraw 60 fps permanent tant qu'une règle reste affichée */
-  if (dirty || drag || temp || (replay && replay.picking)) {
-    dirty = false;
+     plus de redraw 60 fps permanent tant qu'une règle reste affichée.
+     redrawStreak : pendant une interaction continue (pan/drag), le glow des rects
+     est coupé (shadowBlur coûteux) et rétabli par une frame de finition. */
+  const active = dirty || drag || temp || (replay && replay.picking);
+  const polish = !active && redrawStreak > 2;
+  if (!active) redrawStreak = 0;
+  if (active || polish) {
+    if (active) { dirty = false; redrawStreak++; }
+    hudGlow = redrawStreak <= 2;
     ctx.clearRect(0, 0, cvW, cvH);
     /* ceinture : une exception dans un tracé ne doit jamais tuer la boucle rAF ;
        le restore compense le save de drawOne resté ouvert (no-op si pile vide) */
@@ -1701,12 +1764,13 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 
 /* --- bougies du passé : chargement auto en scrollant vers la gauche --- */
 ts().subscribeVisibleLogicalRangeChange(async r => {
-  if (!r || r.from > 30 || replay || loading || loadingOld || oldestDone || !candles.length) return;
+  // retryTimer : pendant un backoff, candles = ANCIEN contexte → tout fetch mélangerait deux TF/symboles
+  if (!r || r.from > 30 || replay || loading || retryTimer || loadingOld || oldestDone || !candles.length) return;
   loadingOld = true;
   const seq = loadSeq;
   try {
     const endT = candles[0].time * 1000 - 1;
-    const resp = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500&endTime=${endT}`);
+    const resp = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500&endTime=${endT}`, { signal: AbortSignal.timeout(10000) });
     const k = await resp.json();
     if (seq !== loadSeq || replay || loading || !Array.isArray(k)) return;   // supplanté pendant le fetch
     if (!candles.length || candles[0].time * 1000 - 1 !== endT) return;      // la tête a bougé (cap) → trou sinon
@@ -1726,6 +1790,7 @@ try {
   applyTheme(valid ? st : { ...THEMES.or }, false);
 } catch { applyTheme({ ...THEMES.or }, false); }
 document.querySelectorAll('.tool[data-tip]').forEach(b => b.setAttribute('aria-label', b.dataset.tip));
+$('symBtn').textContent = symbol + ' ▾';   // reflète le symbole restauré
 sizeCv();
 syncPropbar();
 loadDrawings();
