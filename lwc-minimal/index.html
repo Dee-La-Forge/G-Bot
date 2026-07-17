@@ -1008,7 +1008,8 @@ function saveDrawings() {
    ancien schéma) ne doit jamais atteindre drawOne/hitTest — sinon exception dans le rAF */
 const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
-const tfOk = t => typeof t === 'string' && t !== '1m' && Object.hasOwn(TFSEC, t);   // TF de zone = 3m → 1M, aligné sur propTf
+const tfOk = t => typeof t === 'string' && Object.hasOwn(TFSEC, t);   // TF de zone = 1m → 1M, aligné sur propTf
+const zLabel = t => t === '1M' ? '1MOIS' : t.toUpperCase();   // nomenclature zones : minutes en M, mensuel désambiguïsé
 function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
@@ -1219,9 +1220,9 @@ function syncPropbar() {
     $('propTf').value = r ? (r.tfk || '') : rectTf;
   }
 }
-TFS.slice(1).forEach(t => {   // 3m → 1M (le 1m n'est pas un TF de zone) ; nomenclature zones = MAJUSCULES
+TFS.forEach(t => {   // 1m → 1M ; nomenclature zones = MAJUSCULES (1M = minute, mensuel = 1MOIS)
   const o = document.createElement('option');
-  o.value = t; o.textContent = t.toUpperCase();
+  o.value = t; o.textContent = zLabel(t);
   $('propTf').appendChild(o);
 });
 const rectSel = () => sel != null && drawings[sel] && drawings[sel].type === 'rect' ? drawings[sel] : null;
@@ -1729,7 +1730,7 @@ function drawOne(d, isSel) {
         ctx.stroke();
         ctx.shadowBlur = 0;
         const k = RKINDS[d.kind];
-        const lbl = (k ? k.label : '') + (d.tfk ? (k ? ' · ' : '') + d.tfk.toUpperCase() : '');
+        const lbl = (k ? k.label : '') + (d.tfk ? (k ? ' · ' : '') + zLabel(d.tfk) : '');
         if (lbl && w > 34 && h > 16) {   // label centré, taille dynamique
           const fs = Math.max(9, Math.min(24, h * .24, w * .14));
           ctx.fillStyle = hexToRgba(col, .92);
