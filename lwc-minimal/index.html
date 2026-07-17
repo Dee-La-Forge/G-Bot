@@ -507,7 +507,12 @@ function applyBar(bar) {
 }
 
 /* rattrape les bougies manquantes entre la dernière connue et maintenant */
-let gapFilling = false;
+let gapFilling = false, lastGapReq = 0;
+function fillGapSoon() {   // throttle : au plus une tentative toutes les 2 s (appelé depuis le flux aggTrade)
+  const n = Date.now();
+  if (n - lastGapReq < 2000) return;
+  lastGapReq = n; fillGap();
+}
 async function fillGap() {
   if (gapFilling || !candles.length) return;
   gapFilling = true;
@@ -529,25 +534,31 @@ async function fillGap() {
   } catch {} finally { gapFilling = false; }
 }
 
-let loading = false;
-async function load() {
+let loading = false, retryTimer = null;
+async function load(keepZoom = false, attempt = 0) {
   const seq = ++loadSeq;
   loading = true;
+  clearTimeout(retryTimer); retryTimer = null;
   stopWs();
   oldestDone = false;
   $('dot').classList.remove('live');
+  const retry = () => {   // échec ≠ app morte : backoff 5 s → 30 s tant que rien ne nous a supplantés
+    retryTimer = setTimeout(() => { if (seq === loadSeq && !replay) load(keepZoom, attempt + 1); },
+      Math.min(30000, 5000 * 2 ** attempt));
+  };
   try {
     const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500`);
     const k = await r.json();
     if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
-    if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); return; }
+    if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); retry(); return; }
     candles = k.map(mapK);
     setPrecision(candles.at(-1).close);
     setAll(candles);
-    ts().resetTimeScale(); ts().scrollToRealTime();
+    if (!keepZoom) ts().resetTimeScale();
+    ts().scrollToRealTime();
     refreshTop();
     startWs();
-  } catch (e) { if (seq === loadSeq) toast('Réseau : ' + e.message); }
+  } catch (e) { if (seq === loadSeq) { toast('Réseau : ' + e.message); retry(); } }
   finally { if (seq === loadSeq) loading = false; }
 }
 
@@ -627,7 +638,7 @@ function startWs(attempt = 0) {
           if (p < last.low) last.low = p;
           series.update(last);
           refreshTop(); invalidate();
-        }
+        } else if (tt >= barEnd(last.time)) fillGapSoon();   // kline muet mais trades vivants → rattrapage REST
       } else {
         const k = d.k;
         applyBar({ time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v });
@@ -783,6 +794,7 @@ $('rpPlay').onclick = () => replay && (replay.playing ? rpPause() : rpPlay());
 $('rpStep').onclick = () => { rpPause(); rpStep(); };
 $('rpPick').onclick = () => {
   if (!replay) return;
+  resetTool();   // un outil armé avalerait le clic de pick (stopPropagation) et créerait un tracé parasite
   rpPause(); replay.picking = true;
   setAll(replay.data);
   $('hint').hidden = false;
@@ -852,14 +864,30 @@ function saveDrawings() {
   try { localStorage.setItem('orion-draw-' + symbol, JSON.stringify(drawings)); } catch {}
   invalidate();   // toute mutation de tracé passe par ici → redessine
 }
+/* validation profonde : une entrée corrompue (autre onglet, autre repo même origine,
+   ancien schéma) ne doit jamais atteindre drawOne/hitTest — sinon exception dans le rAF */
+const numOk = v => typeof v === 'number' && isFinite(v);
+const ptOk = p => p && numOk(p.t) && numOk(p.price);
+function drawingOk(d) {
+  if (!d || typeof d.type !== 'string') return false;
+  if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
+  if (d.width != null && !numOk(d.width)) return false;
+  switch (d.type) {
+    case 'hline':   return numOk(d.price);
+    case 'vline':   return numOk(d.t);
+    case 'hray':    return numOk(d.t) && numOk(d.price);
+    case 'text':    return numOk(d.t) && numOk(d.price) && typeof d.text === 'string';
+    case 'brush':   return Array.isArray(d.pts) && d.pts.length > 0 && d.pts.every(ptOk);
+    case 'channel': return ptOk(d.a) && ptOk(d.b) && numOk(d.off);
+    case 'long': case 'short':
+      return ptOk(d.a) && !!d.b && numOk(d.b.t) && numOk(d.target) && numOk(d.stop);
+    default:        return AB_TYPES.includes(d.type) && ptOk(d.a) && ptOk(d.b);
+  }
+}
 function loadDrawings() {
   try {
-    const arr = JSON.parse(localStorage.getItem('orion-draw-' + symbol)) || [];
-    drawings = arr.filter(d => d && d.type && (   // écarte les entrées corrompues / ancien schéma {l}
-      d.type === 'hline' ? d.price != null :
-      d.pts ? d.pts.length && d.pts[0].t != null :
-      d.a ? d.a.t != null :
-      d.t != null));
+    const arr = JSON.parse(localStorage.getItem('orion-draw-' + symbol));
+    drawings = (Array.isArray(arr) ? arr : []).filter(drawingOk);
   } catch { drawings = []; }
   resetTransient(); invalidate();
 }
@@ -890,8 +918,9 @@ function chanGeom(d) {
   return { x1, y1, x2, y2, y1b: series.priceToCoordinate(d.a.price + d.off), y2b: series.priceToCoordinate(d.b.price + d.off) };
 }
 function rayEnd(x1, y1, x2, y2) {
-  const ex = paneW();
-  return [ex, x2 !== x1 ? y1 + (y2 - y1) * (ex - x1) / (x2 - x1) : y2];
+  if (x2 === x1) return [x2, y2 >= y1 ? paneH() : 0];   // rayon vertical : prolongé dans le sens de B
+  const ex = x2 > x1 ? paneW() : 0;                     // le rayon s'étend de A À TRAVERS B
+  return [ex, y1 + (y2 - y1) * (ex - x1) / (x2 - x1)];
 }
 function boxFS(x1, y1, x2, y2) {
   ctx.fillRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
@@ -1487,11 +1516,14 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
   if (dirty || drag || temp || measure || (replay && replay.picking)) {
     dirty = false;
     ctx.clearRect(0, 0, cvW, cvH);
+    /* ceinture : une exception dans un tracé ne doit jamais tuer la boucle rAF ;
+       le restore compense le save de drawOne resté ouvert (no-op si pile vide) */
+    const safeDraw = (d, isSel) => { try { drawOne(d, isSel); } catch { try { ctx.restore(); } catch {} } };
     if (showDraw) {
-      drawings.forEach((d, i) => drawOne(d, i === sel));
-      if (temp) drawOne(temp, false);
+      drawings.forEach((d, i) => safeDraw(d, i === sel));
+      if (temp) safeDraw(temp, false);
     }
-    if (measure) drawOne(measure, false);
+    if (measure) safeDraw(measure, false);
     if (replay && replay.picking && curtainX != null) {
       const w = paneW(), h = paneH();
       if (curtainX < w) {
