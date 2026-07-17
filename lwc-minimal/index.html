@@ -733,10 +733,23 @@ async function load(keepZoom = false, attempt = 0) {
   };
   try {
     let k;
-    if (isSecTf()) {   // secondes : construit depuis les derniers aggTrades (historique court par nature)
-      const tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
-      if (Array.isArray(tr) && tr.length) { lastTradeMs = tr[tr.length - 1].T; k = tradesToBars(tr); }
-      else k = tr;
+    if (isSecTf()) {   // secondes : construit depuis les aggTrades, pagination arrière bornée pour l'historique
+      let tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
+      if (Array.isArray(tr) && tr.length) {
+        lastTradeMs = tr[tr.length - 1].T;
+        const needMs = 400 * (TFSEC[tf] || 15) * 1000;   // couverture visée ≈ 400 seaux
+        for (let g = 0; g < 15; g++) {                    // best-effort : borné par l'activité du symbole
+          if (tr[tr.length - 1].T - tr[0].T >= needMs || tr[0].a <= 1) break;
+          const prev = await fetchJson(`${AGGT}?symbol=${symbol}&fromId=${Math.max(0, tr[0].a - 1000)}&limit=1000`, 8000);
+          if (seq !== loadSeq || replay) return;
+          if (!Array.isArray(prev) || !prev.length) break;
+          const firstId = tr[0].a;
+          const older = prev.filter(t => t.a < firstId);
+          if (!older.length) break;
+          tr = older.concat(tr);
+        }
+        k = tradesToBars(tr);
+      } else k = tr;
     } else k = await fetchK('', 500);
     if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
     if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); retry(); return; }
@@ -744,6 +757,14 @@ async function load(keepZoom = false, attempt = 0) {
     if (isSecTf()) oldestDone = true;   // pas de scroll-back en secondes
     bucketVols = new Map();
     dataCtx = symbol + '|' + tf;
+    // TF agrégés (4m, 8m…) : le premier fetch plafonné à 1500 bougies SOURCE peut être court →
+    // on approfondit jusqu'à ~400-500 seaux avant d'afficher (une seule transition)
+    for (let g = 0; !isSecTf() && candles.length < 400 && !oldestDone && g < 3; g++) {
+      const older = await fetchOlder(1500);
+      if (seq !== loadSeq || replay) return;
+      if (!Array.isArray(older) || !older.length) break;
+      candles = older.concat(candles);
+    }
     setPrecision(candles.at(-1).close);
     if (keepRange && keepRange.from != null) {
       /* changement de TF : on reste sur la MÊME fenêtre temporelle (comme TV).
