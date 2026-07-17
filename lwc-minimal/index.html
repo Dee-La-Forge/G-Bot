@@ -1421,10 +1421,10 @@ function anchorTs(d, pick) {
   for (const v of [d.a && d.a.t, d.b && d.b.t, d.t]) if (v != null) m = m == null ? v : pick(m, v);
   return m;
 }
-function dragMaxT(o, part) {   // ancre max réellement déplacée par un drag (miroir de futureHidden)
+function dragExtT(o, part, pick) {   // ancre extrême réellement déplacée par un drag (miroir de futureHidden)
   if (part === 'a' || part === 'b') return o[part] && o[part].t != null ? o[part].t : null;
   if (part === 'target' || part === 'stop' || part === 'c') return null;   // prix seul
-  return anchorTs(o, Math.max);
+  return anchorTs(o, pick);
 }
 const minTCache = new WeakMap();
 function futureHidden(d) {
@@ -1552,26 +1552,26 @@ document.addEventListener('mousemove', e => {
     const dy = m.y - drag.y0;
     const d = drawings[drag.i], o = drag.orig;
     const lim = dataNow().length + 2000;   // borne d'extrapolation, invariante sur le mousemove
-    if (replay) {
-      /* butée RIGIDE contre la tête de lecture : on plafonne le delta partagé, pas chaque
-         ancre — sinon un drag de corps écrase le tracé (les ancres s'empilent sur la tête) */
-      const h = curBar();
-      if (!('maxL' in drag)) {   // invariants du drag (orig/part figés au mousedown) : calculés UNE fois
-        const mts = dragMaxT(o, drag.part);
-        drag.maxL = mts != null ? lOf(mts) : null;
-      }
-      if (h && drag.maxL != null) {
-        const lh = lOf(h.time);
-        if (lh != null) dx = Math.min(dx, Math.max((lh - drag.maxL) * barSp, 0));
-      }
+    if (!('maxL' in drag)) {   // invariants du drag (orig/part figés au mousedown) : calculés UNE fois
+      const mt = dragExtT(o, drag.part, Math.max), mn = dragExtT(o, drag.part, Math.min);
+      drag.maxL = mt != null ? lOf(mt) : null;
+      drag.minL = mn != null ? lOf(mn) : null;
+    }
+    /* butées RIGIDES sur le delta PARTAGÉ — jamais par ancre : ça écraserait la forme,
+       et une ancre déjà au-delà de la borne serait téléportée. Bornes ±lim des deux
+       côtés, plus la tête de lecture en replay ; une ancre hors borne ne peut que rentrer. */
+    if (drag.maxL != null) dx = Math.min(dx, Math.max((lim - drag.maxL) * barSp, 0));
+    if (drag.minL != null) dx = Math.max(dx, Math.min((-lim - drag.minL) * barSp, 0));
+    if (replay && drag.maxL != null) {
+      const h = curBar(), lh = h ? lOf(h.time) : null;
+      if (lh != null) dx = Math.min(dx, Math.max((lh - drag.maxL) * barSp, 0));
     }
     const mvT = t => {
       /* delta appliqué en logique fractionnaire : coordinateToLogical arrondit à l'entier (ceil),
-         ce qui ferait sauter d'une bougie toute ancre inter-bougies (tracé venu d'un autre TF) ;
-         borné : pas d'ancre expédiée à des milliers d'écrans des données */
+         ce qui ferait sauter d'une bougie toute ancre inter-bougies (tracé venu d'un autre TF) */
       const l = lOf(t);
       if (l == null) return t;
-      const nt = tOf(Math.max(-lim, Math.min(lim, l + dx / barSp)));
+      const nt = tOf(l + dx / barSp);
       return nt != null ? nt : t;
     };
     const mvP = p => { const c = series.priceToCoordinate(p); const np = c != null ? series.coordinateToPrice(c + dy) : null; return np != null ? np : p; };
@@ -1635,7 +1635,7 @@ function drawOne(d, isSel) {
      EXCLUS : long/short et la règle (multicolores — un halo doré les salirait) */
   const noGlow = d.type === 'long' || d.type === 'short' || d.type === 'measure';
   ctx.shadowColor = col;
-  ctx.shadowBlur = hudGlow && (!noGlow || isSel) ? (isSel ? 12 : 6) : 0;
+  ctx.shadowBlur = hudGlow && !noGlow ? (isSel ? 12 : 6) : 0;   // long/short/règle : JAMAIS de halo, même sélectionnés
   if (d.type === 'hline') {
     const y = series.priceToCoordinate(d.price);
     if (y != null) {
