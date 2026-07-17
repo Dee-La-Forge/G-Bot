@@ -410,8 +410,10 @@ function beep() {   // deux notes brèves, façon carillon
     o.start(s); o.stop(s + 0.16);
   });
 }
-let alertPrev = null, alertFlashUntil = 0;   // dernier prix vu (détection de croisement) ; fenêtre de flash
+let alertPrev = null, alertFlashUntil = 0, hasAlerts = false;   // dernier prix vu (croisement) ; fenêtre de flash
 function checkAlerts(price) {
+  // NE tire PAS pendant un rattrapage en masse (fillGap/fillGapSec rejouent des prix HISTORIQUES → alertes rétroactives)
+  if (!hasAlerts || gapFilling) { alertPrev = null; return; }
   if (alertPrev != null && price !== alertPrev) {
     const now = Date.now();
     for (const d of drawings) {
@@ -421,6 +423,7 @@ function checkAlerts(price) {
       if (crossed && now - (d.firedAt || 0) > 3000) {   // anti-spam : 3 s entre deux déclenchements
         d.firedAt = now;
         alertFlashUntil = now + 1500;   // le rAF redessine pendant tout le flash
+        setTimeout(invalidate, 1550);   // frame de finition : le trait revient fin même sur flux gelé
         beep();
         toast(`⚠ Alerte ${fmt(lvl)} franchie`);
         invalidate();
@@ -517,24 +520,30 @@ function cacheBars() {   // photographie le contexte courant avant de le quitter
 /* ---- persistance des bougies sur disque : rechargement = affichage instantané puis rattrapage ---- */
 const BARS_CAP = 2000, BARS_CTX_MAX = 4, BARS_SCHEMA = 1;
 const barsKey = (s, t) => 'orion-bars-' + s + '|' + t;
+function readIdx() {   // index LRU des contextes persistés, réparé si corrompu (course multi-onglets, non-tableau)
+  let idx;
+  try { idx = JSON.parse(localStorage.getItem('orion-bars-idx')); } catch { idx = null; }
+  if (!Array.isArray(idx)) idx = [];
+  return idx;
+}
 function persistBars() {
   if (!candles.length || !ctxFresh()) return;
   // secondes tronquées : firstTradeId ne correspondrait plus à candles[0] → on ne persiste que si tout tient
   if (isSecTf() && candles.length > BARS_CAP) return;
-  try {
-    const key = barsKey(symbol, tf);
-    const atStart = oldestDone && candles.length <= BARS_CAP;   // a-t-on gardé le tout début ?
-    localStorage.setItem(key, JSON.stringify({
-      v: BARS_SCHEMA, t: Date.now(), atStart,
-      fi: firstTradeId, lm: lastTradeMs, la: lastAggId,
-      b: candles.slice(-BARS_CAP),
-    }));
-    let idx = [];
-    try { idx = JSON.parse(localStorage.getItem('orion-bars-idx')) || []; } catch {}
-    idx = idx.filter(k => k !== key); idx.push(key);
-    while (idx.length > BARS_CTX_MAX) { try { localStorage.removeItem(idx.shift()); } catch {} }
-    lsSet('orion-bars-idx', JSON.stringify(idx));
-  } catch {}   // quota dépassé : tant pis, la session reste fonctionnelle
+  const key = barsKey(symbol, tf);
+  const atStart = oldestDone && candles.length <= BARS_CAP;   // a-t-on gardé le tout début ?
+  const payload = JSON.stringify({ v: BARS_SCHEMA, t: Date.now(), atStart, fi: firstTradeId, lm: lastTradeMs, la: lastAggId, b: candles.slice(-BARS_CAP) });
+  // index d'abord : évincer AVANT d'écrire → auto-guérison sous quota (une écriture peut échouer, on retente une fois)
+  let idx = readIdx().filter(k => k !== key);
+  // balaie les clés orion-bars-* réelles absentes de l'index (orphelins d'un autre onglet) et tronque le LRU
+  try { for (const k of Object.keys(localStorage)) if (k.startsWith('orion-bars-') && k !== 'orion-bars-idx' && !idx.includes(k) && k !== key) localStorage.removeItem(k); } catch {}
+  idx.push(key);
+  while (idx.length > BARS_CTX_MAX) { try { localStorage.removeItem(idx.shift()); } catch {} }
+  const write = () => { localStorage.setItem(key, payload); lsSet('orion-bars-idx', JSON.stringify(idx)); };
+  try { write(); }
+  catch {   // quota : évince le plus ancien (hors courant) et retente UNE fois
+    try { const victim = idx.find(k => k !== key); if (victim) { localStorage.removeItem(victim); idx = idx.filter(k => k !== victim); write(); } } catch {}
+  }
 }
 function loadPersisted() {   // renvoie {b, atStart, fi, lm, la} sain et pas trop périmé, sinon null
   try {
@@ -544,7 +553,8 @@ function loadPersisted() {   // renvoie {b, atStart, fi, lm, la} sain et pas tro
     if (!o || o.v !== BARS_SCHEMA || !Array.isArray(o.b) || !o.b.length) return null;
     // trop vieux = trop de trou à combler : rechargement frais (secondes très court, klines borné à fillGap)
     const maxAge = isSecTf() ? 90000 : 18000 * TFSEC[tfDef().src] * 1000;
-    if (typeof o.t !== 'number' || Date.now() - o.t > maxAge) return null;
+    const age = Date.now() - o.t;
+    if (typeof o.t !== 'number' || age < 0 || age > maxAge) return null;   // age < 0 : horloge reculée → rejeter
     let prev = -Infinity;   // validation profonde : OHLCV numérique, temps STRICTEMENT croissant
     for (const c of o.b) {
       if (!c || !numOk(c.time) || c.time <= prev || !numOk(c.open) || !numOk(c.high) || !numOk(c.low) || !numOk(c.close) || !numOk(c.volume)) return null;
@@ -731,6 +741,8 @@ async function fetchTradesBack(firstId, pages) {
   return { trades: older, healthy: rs.every(r => Array.isArray(r)) };
 }
 function applyTrades(tr) {   // paquet de trades → quelques applyBar par SEAU (jamais 1000 updates LWC par tick)
+  tr = tr.filter(t => t.a > lastAggId);   // IDEMPOTENT par id : un trade déjà appliqué (poll+fillGap concurrents) ne double PAS le volume
+  if (!tr.length) return;
   const bars = tradesToBars(tr);
   for (const b of bars) {
     const last = candles[candles.length - 1];
@@ -755,21 +767,24 @@ async function fillGapSec() {
     }
   } catch {} finally { gapFilling = false; }
 }
-function fillGapSecSoon() {   // même throttle que fillGapSoon
+let lastGapReqSec = 0;
+function fillGapSecSoon() {   // throttle PROPRE aux secondes (ne pas partager avec fillGapSoon des klines)
   const n = Date.now();
-  if (n - lastGapReq < 2000) return;
-  lastGapReq = n; fillGapSec();
+  if (n - lastGapReqSec < 2000) return;
+  lastGapReqSec = n; fillGapSec();
 }
 /* approfondit l'historique d'un TF secondes APRÈS l'affichage de la 1re page :
    petits lots séquentiels (léger pour l'API), prepend vers la gauche en gardant
    la fenêtre temporelle visible → aucun saut, la 1re page reste instantanée */
 async function deepenSec(seq) {   // garde seq : une boucle périmée (TF/symbole changé) se rompt sans muter
-  try {
-    const target = 500 * tfDef().sec;   // ~500 seaux visés
-    for (let g = 0; g < 8; g++) {
-      if (seq !== loadSeq || replay || !firstTradeId || firstTradeId <= 1) break;
-      if (candles[candles.length - 1].time - candles[0].time >= target) break;
-      if (candles.length >= MAX_BARS) break;
+  const target = 500 * tfDef().sec;   // ~500 seaux visés
+  for (let g = 0; g < 8; g++) {
+    // loadingOld = VERROU de prepend partagé avec le scroll-back : jamais deux prepends concurrents
+    if (seq !== loadSeq || replay || loadingOld || !firstTradeId || firstTradeId <= 1) break;
+    if (candles[candles.length - 1].time - candles[0].time >= target) break;
+    if (candles.length >= MAX_BARS) break;
+    loadingOld = true;   // tenu à travers l'await : le scroll-back ne peut pas muter firstTradeId entre-temps
+    try {
       const { trades, healthy } = await fetchTradesBack(firstTradeId, 2);
       if (seq !== loadSeq || replay) break;
       if (!trades.length) { if (healthy) oldestDone = true; break; }
@@ -787,8 +802,8 @@ async function deepenSec(seq) {   // garde seq : une boucle périmée (TF/symbol
       candles = older.concat(candles);
       setAll(candles);
       if (vr) try { ts().setVisibleRange(vr); } catch {}
-    }
-  } catch {}
+    } catch { break; } finally { loadingOld = false; }
+  }
 }
 /* scroll-back des TF secondes : 5 pages de trades en arrière par déclenchement.
    'end' = genèse atteinte ; null = réessayer plus tard (erreur/contexte) */
@@ -849,7 +864,11 @@ function applyBar(bar) {
     if (bar.time > barEnd(last.time) && !isSecTf()) { fillGap(); return; }
     candles.push(bar); isNew = true;
     bucketVols.clear();   // nouveau seau de tête : les volumes source du précédent ne doivent JAMAIS s'y sommer
-    if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); return; }
+    if (candles.length > MAX_BARS + 1000) {
+      candles = candles.slice(-MAX_BARS);
+      if (isSecTf()) { firstTradeId = null; oldestDone = true; }   // curseur de tête rasé : le scroll-back par trade n'a plus de repère
+      setAll(candles); return;
+    }
   } else if (bar.time === last.time) candles[candles.length - 1] = bar;
   else return;
   series.update(bar); volSeries.update(volOf(bar));
@@ -943,6 +962,7 @@ async function load(keepZoom = false, attempt = 0) {
   oldestDone = false;
   oldErrUntil = 0;   // la pause d'erreur du scroll-back ne survit pas à un changement de contexte
   hoverT = null;     // nouveau contexte : la légende live reprend la main
+  alertPrev = null;  // pas de franchissement fantôme entre l'ancien prix et le nouveau (ex. BTC→DOGE)
   $('dot').classList.remove('live');
   const retry = () => {   // échec ≠ app morte : backoff 5 s → 30 s tant que rien ne nous a supplantés
     retryTimer = setTimeout(() => { if (seq === loadSeq && !replay) load(keepZoom, attempt + 1); },
@@ -1057,6 +1077,7 @@ function startPoll(seq) {
     if (replay || !candles.length) return;
     if (backoff > 0) { backoff--; return; }              // recul après erreur (429, réseau…)
     if (++ticks % 30 === 0) syncClock();                 // resynchronise l'horloge toutes les ~60 s
+    if (isSecTf() && (gapFilling || !lastAggId)) return;   // fillGapSec en cours OU curseur non amorcé (retour cache) : le rattrapage s'en charge
     inFlight = true;
     try {
       let k;
@@ -1066,7 +1087,7 @@ function startPoll(seq) {
       if (!Array.isArray(k)) { backoff = 15; failed(); return; }   // {code,msg} persistant = flux mort
       fails = 0; $('dot').classList.add('live');
       if (isSecTf()) {
-        if (k.length) applyTrades(k);            // batché par seau (pas 1000 updates LWC)
+        if (k.length) applyTrades(k);            // batché par seau + idempotent par id (pas de double-compte)
         if (k.length === 1000) fillGapSecSoon(); // page pleine = retard : on draine sans attendre le tick suivant
       }
       else k.slice(-2).forEach(x => applyBar(x));  // seau le plus ancien du rollup potentiellement partiel : écarté
@@ -1118,7 +1139,7 @@ function startWs(attempt = 0) {
       if (stream.endsWith('aggTrade')) {
         const p = +d.p, tt = d.T / 1000, last = candles[candles.length - 1];
         if (isSecTf()) {
-          if (lastAggId && d.a > lastAggId + 1) fillGapSecSoon();   // trou d'ids (retour de cache…) : rattrapage ORDONNÉ, sans double-compte
+          if (lastAggId && d.a > lastAggId + 1) { if (!gapFilling) fillGapSec(); }   // trou d'ids : rattrapage REST IMMÉDIAT (idempotent, non throttlé, gardé par gapFilling) — pas d'apply inline (double-compte)
           else { applyTrade(p, +d.q, tt); lastTradeMs = d.T; lastAggId = d.a; }
         }
         // borne haute : un trade de la bougie SUIVANTE ne doit jamais réécrire la bougie clôturée
@@ -1203,6 +1224,9 @@ TFS.forEach(t => {
   };
   $('tfs').appendChild(b);
 });
+$('tfs').addEventListener('wheel', e => {   // molette verticale → défile la rangée des 23 TF (2W…4M sur écran étroit)
+  if (e.deltaY && $('tfs').scrollWidth > $('tfs').clientWidth) { $('tfs').scrollLeft += e.deltaY; e.preventDefault(); }
+}, { passive: false });
 
 /* ---------- symboles ---------- */
 let symSeq = 0;
@@ -1423,6 +1447,7 @@ function tOf(l) {            // index logique → temps unix
 }
 let saveFailed = false, saveTimer = null;
 function saveDrawings() {
+  hasAlerts = drawings.some(d => d.type === 'alert');   // early-out de checkAlerts si aucune alerte
   invalidate();   // toute mutation de tracé passe par ici → redessine
   clearTimeout(saveTimer);   // pipette couleur : input en rafale → sérialisation/écriture débouncées
   saveTimer = setTimeout(() => {
@@ -1473,6 +1498,7 @@ function loadDrawings() {
       return c;
     }).filter(drawingOk);
   } catch { drawings = []; }
+  hasAlerts = drawings.some(d => d.type === 'alert');
   resetTransient(); invalidate();
 }
 
@@ -1658,7 +1684,8 @@ function syncPropbar() {
      et les positions long/short ont couleurs/épaisseur codées en dur */
   const dSel = sel != null ? drawings[sel] : null;
   const posSel = !!(dSel && (dSel.type === 'long' || dSel.type === 'short'));
-  $('propStyle').hidden = !!rectCtx || posSel;
+  const alertSel = !!(dSel && dSel.type === 'alert');   // trait forcé pointillé : le sélecteur de style n'a aucun effet
+  $('propStyle').hidden = !!rectCtx || posSel || alertSel;
   $('propWidth').hidden = posSel;
   $('propColor').hidden = posSel;
   $('swatches').hidden = posSel;
