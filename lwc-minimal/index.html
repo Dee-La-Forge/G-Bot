@@ -1164,7 +1164,8 @@ document.addEventListener('mousemove', e => {
     temp.b = { t: p.t }; temp.target = p.price;
   } else temp.b = p;
 });
-document.addEventListener('mouseup', () => {
+document.addEventListener('mouseup', e => {
+  if (e.button !== 0) return;   // un clic droit (menu contextuel) ne committe pas le tracé en cours
   if (!toolDown) return;
   toolDown = false;
   if (temp) {
@@ -1185,8 +1186,11 @@ document.addEventListener('mouseup', () => {
       if (la == null || lb == null || lb - la < 2) temp.b = { t: tOf((la ?? 0) + 20) ?? temp.a.t };
       const d = temp; temp = null;
       commit(d);
-    } else if (temp.type === 'brush' ? temp.pts.length > 1 : (temp.b.t != null && temp.b.price != null)) {
+    } else if (temp.type === 'brush' ? temp.pts.length > 1
+             : (temp.b.t != null && temp.b.price != null &&
+                (temp.b.t !== temp.a.t || temp.b.price !== temp.a.price))) {   // pas de tracé de longueur nulle
       const d = temp; temp = null;
+      delete d._lx; delete d._ly;   // état transitoire du pinceau, inutile en localStorage
       commit(d);
     } else temp = null;
   }
@@ -1315,7 +1319,7 @@ wrap.addEventListener('mousedown', e => {
   } else if (sel != null) select(null);
 }, true);
 wrap.addEventListener('dblclick', e => {
-  if (tool !== 'cursor' || uiGuard(e)) return;
+  if (tool !== 'cursor' || !showDraw || uiGuard(e)) return;   // pas d'édition d'un texte masqué (œil fermé)
   const m = mpos(e);
   const ht = hitTest(m.x, m.y);
   if (ht && drawings[ht.i].type === 'text') {
@@ -1339,8 +1343,13 @@ document.addEventListener('mousemove', e => {
     if (d.type === 'long' || d.type === 'short') {
       if (drag.part === 'a') d.a = { t: mvT(o.a.t), price: mvP(o.a.price) };
       else if (drag.part === 'b') d.b = { t: mvT(o.b.t) };
-      else if (drag.part === 'target') d.target = mvP(o.target);
-      else if (drag.part === 'stop') d.stop = mvP(o.stop);
+      else if (drag.part === 'target') {   // la cible reste du bon côté de l'entrée (pas de boîtes inversées)
+        const v = mvP(o.target);
+        d.target = d.type === 'long' ? Math.max(v, d.a.price) : Math.min(v, d.a.price);
+      } else if (drag.part === 'stop') {
+        const v = mvP(o.stop);
+        d.stop = d.type === 'long' ? Math.min(v, d.a.price) : Math.max(v, d.a.price);
+      }
       else {
         d.a = { t: mvT(o.a.t), price: mvP(o.a.price) };
         d.b = { t: mvT(o.b.t) };
@@ -1365,7 +1374,7 @@ document.addEventListener('mousemove', e => {
     wrap.style.cursor = hitTest(m.x, m.y) ? 'pointer' : '';
   }
 });
-document.addEventListener('mouseup', () => { if (drag) { drag = null; wrap.style.cursor = ''; saveDrawings(); } });
+document.addEventListener('mouseup', e => { if (e.button === 0 && drag) { drag = null; wrap.style.cursor = ''; saveDrawings(); } });
 
 /* ---------- rendu ---------- */
 function drawOne(d, isSel) {
