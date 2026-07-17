@@ -2,6 +2,8 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://unpkg.com 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://fapi.binance.com wss://fstream.binance.com; img-src 'self'; base-uri 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>G-Bot — Futures Perp</title>
 <style>
   :root {
@@ -48,13 +50,14 @@
     margin: 8px; padding: 6px 8px; background: #060604; border: 1px solid var(--border);
     color: var(--gold-b); border-radius: 4px; font-size: 12px; text-transform: uppercase; outline: none;
   }
+  #symFilter:focus-visible { border-color: var(--gold-b); box-shadow: 0 0 8px rgba(217,182,77,.3); }
   #symList { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--gold-d) transparent; }
   .symItem {
     display: flex; justify-content: space-between; padding: 6px 12px; cursor: pointer; font-size: 12px;
     color: #b39a55; letter-spacing: .5px;
   }
   .symItem:hover { background: rgba(217,182,77,.12); color: var(--gold-b); }
-  .symItem small { color: #6d5c2e; }
+  .symItem small { color: #a89050; }   /* ≥4,5:1 sur le fond du panneau (AA) */
   #tfs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; flex: 1; }
   #tfs::-webkit-scrollbar { display: none; }
   .tfbtn {
@@ -843,12 +846,12 @@ chart.subscribeClick(p => {
 /* ==================== MOTEUR DE DESSIN ==================== */
 const cv = $('overlay'), ctx = cv.getContext('2d');
 const wrap = $('chartwrap');
-let cvW = 0, cvH = 0;   // dimensions CSS du canvas, mises en cache (pas de lecture layout par frame)
+let cvW = 0, cvH = 0, cvDpr = 0;   // dimensions CSS + DPR en cache (pas de lecture layout par frame)
 function sizeCv() {
   const r = wrap.getBoundingClientRect(), dpr = devicePixelRatio || 1;
   if (!r.width || !r.height) return;
-  if (r.width === cvW && r.height === cvH) return;
-  cvW = r.width; cvH = r.height;
+  if (r.width === cvW && r.height === cvH && dpr === cvDpr) return;   // DPR inclus : écran 4K↔FHD à taille CSS égale
+  cvW = r.width; cvH = r.height; cvDpr = dpr;
   cv.width = r.width * dpr; cv.height = r.height * dpr;
   cv.style.width = r.width + 'px'; cv.style.height = r.height + 'px';
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -896,8 +899,10 @@ function tOf(l) {            // index logique → temps unix
   if (i >= a.length - 1) return a[a.length - 1].time + (l - (a.length - 1)) * sec;
   return a[i].time + (l - i) * (a[i + 1].time - a[i].time);
 }
+let saveFailed = false;
 function saveDrawings() {
-  try { localStorage.setItem('orion-draw-' + symbol, JSON.stringify(drawings)); } catch {}
+  try { localStorage.setItem('orion-draw-' + symbol, JSON.stringify(drawings)); saveFailed = false; }
+  catch { if (!saveFailed) { saveFailed = true; toast('Stockage local plein : tracés non sauvegardés'); } }
   invalidate();   // toute mutation de tracé passe par ici → redessine
 }
 /* validation profonde : une entrée corrompue (autre onglet, autre repo même origine,
@@ -991,6 +996,7 @@ document.querySelectorAll('.tool[data-tool]').forEach(b => b.onclick = () => {
 function showPropbar(v) {
   $('propbar').hidden = !v;
   if (v) { $('propbar').style.top = $('replaybar').hidden ? '12px' : '56px'; syncPropbar(); }
+  $('hint').style.top = v && !$('replaybar').hidden ? '104px' : '58px';   // le hint reste lisible sous la propbar
 }
 function resetTool() {
   tool = 'cursor'; temp = null; hideTxtIn();
@@ -1156,8 +1162,11 @@ document.addEventListener('mousemove', e => {
   const p = snap(lpt(e));
   if (p.t == null || p.price == null) return;
   if (temp.type === 'brush') {
-    const lastP = temp.pts[temp.pts.length - 1];
-    if (Math.abs(lOf(p.t) - lOf(lastP.t)) > .05 || p.price !== lastP.price) temp.pts.push(p);
+    if (temp.pts.length >= 3000) return;   // borne dure anti-quota localStorage
+    const m = mpos(e);                     // seuil en pixels écran : le prix flottant change à chaque pixel
+    if (temp._lx != null && Math.hypot(m.x - temp._lx, m.y - temp._ly) < 3) return;
+    temp._lx = m.x; temp._ly = m.y;
+    temp.pts.push(p);
   } else if (temp.type === 'channel' && temp.phase === 2) {
     temp.off = p.price - chPriceAt(temp, p.t);
   } else if (temp.type === 'long' || temp.type === 'short') {
@@ -1172,7 +1181,7 @@ document.addEventListener('mouseup', e => {
     if (temp.type === 'channel') {
       if (temp.phase === 1) { temp.phase = 2; return; }    // on garde l'outil : la souris règle la parallèle
     } else if (temp.type === 'measure') {
-      measure = temp; temp = null;
+      measure = temp; temp = null; invalidate();
     } else if (temp.type === 'long' || temp.type === 'short') {
       const e0 = temp.a.price;
       if (temp.type === 'long') {
@@ -1328,6 +1337,7 @@ wrap.addEventListener('dblclick', e => {
     openTxtIn(e.clientX, e.clientY, drawings[ht.i].text);
   }
 }, true);
+let hoverX = null, hoverY = null, hoverQueued = false;
 document.addEventListener('mousemove', e => {
   if (drag) {
     const m = mpos(e);
@@ -1371,7 +1381,15 @@ document.addEventListener('mousemove', e => {
   }
   if (tool === 'cursor' && showDraw && e.target.closest('#chartwrap') && !uiGuard(e)) {
     const m = mpos(e);
-    wrap.style.cursor = hitTest(m.x, m.y) ? 'pointer' : '';
+    hoverX = m.x; hoverY = m.y;
+    if (!hoverQueued) {   // hit-test complet (coûteux avec de longs pinceaux) : au plus 1×/frame
+      hoverQueued = true;
+      requestAnimationFrame(() => {
+        hoverQueued = false;
+        if (tool === 'cursor' && showDraw && !drag && hoverX != null)
+          wrap.style.cursor = hitTest(hoverX, hoverY) ? 'pointer' : '';
+      });
+    }
   }
 });
 document.addEventListener('mouseup', e => { if (e.button === 0 && drag) { drag = null; wrap.style.cursor = ''; saveDrawings(); } });
@@ -1552,6 +1570,7 @@ function updateCountdown() {
 /* invalidations : tout ce qui peut déplacer les tracés à l'écran */
 ts().subscribeVisibleTimeRangeChange(invalidate);            // pan / zoom / nouvelles bougies
 wrap.addEventListener('wheel', invalidate, { passive: true }); // zoom sur l'axe des prix
+wrap.addEventListener('touchmove', invalidate, { passive: true }); // drag tactile des axes (LWC natif)
 document.addEventListener('mousemove', e => { if (e.buttons) invalidate(); }); // drag d'axe même hors fenêtre
 wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 
@@ -1560,7 +1579,9 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
   updateCountdown();
   if (legendHTML !== legendShown) { $('legend').innerHTML = legendShown = legendHTML; }
   if (lastPriceTxt !== lastPriceShown) { $('lastPrice').textContent = lastPriceShown = lastPriceTxt; }
-  if (dirty || drag || temp || measure || (replay && replay.picking)) {
+  /* measure est statique une fois posée (ancrée t/prix, la vue invalide déjà) :
+     plus de redraw 60 fps permanent tant qu'une règle reste affichée */
+  if (dirty || drag || temp || (replay && replay.picking)) {
     dirty = false;
     ctx.clearRect(0, 0, cvW, cvH);
     /* ceinture : une exception dans un tracé ne doit jamais tuer la boucle rAF ;
@@ -1608,9 +1629,11 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
 
 try {
   const st = JSON.parse(localStorage.getItem('orion-theme'));
-  const valid = st && st.bg && st.grid && st.up && st.down;   // schéma complet, sinon défaut
+  const okc = c => typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c);   // couleur stricte, pas juste truthy
+  const valid = st && okc(st.bg) && okc(st.grid) && okc(st.up) && okc(st.down) && (st.downLine == null || okc(st.downLine));
   applyTheme(valid ? st : { ...THEMES.or }, false);
 } catch { applyTheme({ ...THEMES.or }, false); }
+document.querySelectorAll('.tool[data-tip]').forEach(b => b.setAttribute('aria-label', b.dataset.tip));
 sizeCv();
 syncPropbar();
 loadDrawings();
