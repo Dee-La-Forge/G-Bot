@@ -1219,9 +1219,9 @@ function syncPropbar() {
     $('propTf').value = r ? (r.tfk || '') : rectTf;
   }
 }
-TFS.slice(1).forEach(t => {   // 3m → 1M (le 1m n'est pas un TF de zone)
+TFS.slice(1).forEach(t => {   // 3m → 1M (le 1m n'est pas un TF de zone) ; nomenclature zones = MAJUSCULES
   const o = document.createElement('option');
-  o.value = t; o.textContent = tfLabel(t);
+  o.value = t; o.textContent = t.toUpperCase();
   $('propTf').appendChild(o);
 });
 const rectSel = () => sel != null && drawings[sel] && drawings[sel].type === 'rect' ? drawings[sel] : null;
@@ -1729,7 +1729,7 @@ function drawOne(d, isSel) {
         ctx.stroke();
         ctx.shadowBlur = 0;
         const k = RKINDS[d.kind];
-        const lbl = (k ? k.label : '') + (d.tfk ? (k ? ' · ' : '') + tfLabel(d.tfk) : '');
+        const lbl = (k ? k.label : '') + (d.tfk ? (k ? ' · ' : '') + d.tfk.toUpperCase() : '');
         if (lbl && w > 34 && h > 16) {   // label centré, taille dynamique
           const fs = Math.max(9, Math.min(24, h * .24, w * .14));
           ctx.fillStyle = hexToRgba(col, .92);
