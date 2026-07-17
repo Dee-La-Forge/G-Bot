@@ -1569,11 +1569,14 @@ function drawOne(d, isSel) {
         ctx.stroke();
         ctx.shadowBlur = 0;
         const k = RKINDS[d.kind];
-        if (k) {
-          ctx.fillStyle = col; ctx.font = '600 9px Segoe UI';
-          ctx.letterSpacing = '2px';
-          ctx.fillText(k.label, xa + 7, ya + 14);
-          ctx.letterSpacing = '0px';
+        if (k && w > 34 && h > 16) {   // typo dynamique : suit la taille du rectangle, s'efface s'il est trop petit
+          const fs = Math.max(9, Math.min(24, h * .24, w * .14));
+          ctx.fillStyle = hexToRgba(col, .92);
+          ctx.font = `600 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;
+          ctx.letterSpacing = (fs * .22).toFixed(1) + 'px';
+          ctx.shadowColor = col; ctx.shadowBlur = fs * .45;
+          ctx.fillText(k.label, xa + fs * .55, ya + fs * 1.3);
+          ctx.shadowBlur = 0; ctx.letterSpacing = '0px';
         }
       } else if (d.type === 'ellipse') {
         ctx.beginPath();
