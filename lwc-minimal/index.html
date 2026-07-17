@@ -450,8 +450,9 @@ const atrSeries = chart.addSeries(LWC.LineSeries, {
   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
 });
 atrSeries.priceScale().applyOptions({ scaleMargins: { top: .93, bottom: .01 } });
-let lastAtr = null, indTrs = [], indSum = 0;
+let lastAtr = null, indTrs = [], indSum = 0, indStale = false;
 function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chemin par-bougie passe par updateInd
+  indStale = false;
   const src = dataNow();
   const atr = [];
   indTrs = []; indSum = 0;
@@ -467,6 +468,7 @@ function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chem
   lastAtr = atr.length ? atr[atr.length - 1].value : null;
 }
 function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bougie (somme glissante persistée)
+  if (indStale) return;   // fenêtre désalignée après un prepend différé : computeInd arrive dans 400 ms
   const tr = prev
     ? Math.max(bar.high - bar.low, Math.abs(bar.high - prev.close), Math.abs(bar.low - prev.close))
     : bar.high - bar.low;
@@ -526,6 +528,16 @@ const volOf = b => ({ time: b.time, value: b.volume, color: volColor(b.open, b.c
 function setAll(arr) {
   series.setData(arr); volSeries.setData(arr.map(volOf));
   computeInd(); invalidate();
+}
+/* prepend massif (scroll-back) : bougies+volume tout de suite, mais l'ATR — O(n) + setData
+   intégral — attend la fin du scroll au lieu de repayer 50 000 points à chaque tranche */
+let indTimer = null;
+function setAllDeferInd(arr) {
+  series.setData(arr); volSeries.setData(arr.map(volOf));
+  indStale = true;
+  clearTimeout(indTimer);
+  indTimer = setTimeout(computeInd, 400);
+  invalidate();
 }
 function refreshTop() {
   const c = candles[candles.length - 1];
@@ -1808,13 +1820,13 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
   if (!r || r.from > 30 || replay || loading || (retryTimer && !ctxFresh()) || loadingOld || oldestDone || !candles.length) return;
   loadingOld = true;
   try {
-    const older = await fetchOlder(500);
+    const older = await fetchOlder(1500);        // max Binance : 3× moins de reconstructions qu'à 500
     if (replay || loading) return;               // supplanté pendant le fetch
     if (older == null) return;                   // contexte périmé (seq/tête) → réponse jetée
     if (!older.length) { oldestDone = true; return; }
     candles = older.concat(candles);
-    setAll(candles);
-    if (older.length < 500 || candles.length >= MAX_BARS) oldestDone = true; // borne mémoire du scroll-back
+    setAllDeferInd(candles);
+    if (older.length < 1500 || candles.length >= MAX_BARS) oldestDone = true; // borne mémoire du scroll-back
   } catch {} finally { loadingOld = false; }
 });
 
