@@ -217,6 +217,12 @@
   }
   [hidden] { display: none !important; }
   body.busy { cursor: progress; }
+  #apiban {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 8;
+    background: #2a1608; border: 1px solid #7a4a1f; color: #e0a86c; font-size: 12px;
+    padding: 5px 14px; border-radius: 5px; letter-spacing: .5px; white-space: nowrap;
+    box-shadow: 0 4px 18px rgba(0,0,0,.6);
+  }
 </style>
 </head>
 <body>
@@ -369,6 +375,7 @@
       <label>Bougies baisse <input type="color" id="thDown"></label>
       <button id="thReset">Réinitialiser</button>
     </div>
+    <div id="apiban" hidden></div>
     <div id="toast"></div>
   </div>
 </div>
@@ -398,6 +405,7 @@ function unlockAudio() {   // à appeler sur un geste utilisateur (l'AudioContex
 }
 function beep() {   // deux notes brèves, façon carillon
   if (!audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();   // le navigateur a pu re-suspendre (onglet arrière-plan)
   const t0 = audioCtx.currentTime;
   [880, 1174].forEach((f, i) => {
     const o = audioCtx.createOscillator(), g = audioCtx.createGain();
@@ -533,16 +541,34 @@ function persistBars() {
   const key = barsKey(symbol, tf);
   const atStart = oldestDone && candles.length <= BARS_CAP;   // a-t-on gardé le tout début ?
   const payload = JSON.stringify({ v: BARS_SCHEMA, t: Date.now(), atStart, fi: firstTradeId, lm: lastTradeMs, la: lastAggId, b: candles.slice(-BARS_CAP) });
-  // index d'abord : évincer AVANT d'écrire → auto-guérison sous quota (une écriture peut échouer, on retente une fois)
-  let idx = readIdx().filter(k => k !== key);
-  // balaie les clés orion-bars-* réelles absentes de l'index (orphelins d'un autre onglet) et tronque le LRU
-  try { for (const k of Object.keys(localStorage)) if (k.startsWith('orion-bars-') && k !== 'orion-bars-idx' && !idx.includes(k) && k !== key) localStorage.removeItem(k); } catch {}
-  idx.push(key);
-  while (idx.length > BARS_CTX_MAX) { try { localStorage.removeItem(idx.shift()); } catch {} }
-  const write = () => { localStorage.setItem(key, payload); lsSet('orion-bars-idx', JSON.stringify(idx)); };
-  try { write(); }
-  catch {   // quota : évince le plus ancien (hors courant) et retente UNE fois
-    try { const victim = idx.find(k => k !== key); if (victim) { localStorage.removeItem(victim); idx = idx.filter(k => k !== victim); write(); } } catch {}
+  // écrire le payload D'ABORD, puis committer l'index INCLUANT la clé fraîche : un autre onglet
+  // qui lit l'index entre-temps la voit (pas de balayage destructeur en course multi-onglets)
+  const commitIdx = () => {
+    // GC conservateur : n'efface QUE les clés orion-bars-* périmées/invalides (schéma ou âge dépassé),
+    // JAMAIS une clé fraîche d'un autre onglet ; puis tronque le LRU par ANCIENNETÉ du payload.
+    let idx = readIdx().filter(k => k !== key);
+    let others = [];
+    try {
+      for (const k of Object.keys(localStorage)) {
+        if (!k.startsWith('orion-bars-') || k === 'orion-bars-idx' || k === key) continue;
+        let o = null; try { o = JSON.parse(localStorage.getItem(k)); } catch {}
+        const dead = !o || o.v !== BARS_SCHEMA || typeof o.t !== 'number' || Date.now() - o.t > 3 * 86400e3;   // > 3 j = mort
+        if (dead) { localStorage.removeItem(k); idx = idx.filter(x => x !== k); }
+        else others.push({ k, t: o.t });
+      }
+    } catch {}
+    // LRU par temps réel du payload : on garde les BARS_CTX_MAX-1 plus RÉCENTS + la clé courante
+    others.sort((a, b) => a.t - b.t);
+    while (others.length > BARS_CTX_MAX - 1) { const v = others.shift(); try { localStorage.removeItem(v.k); } catch {} idx = idx.filter(x => x !== v.k); }
+    idx = idx.filter(k => k === key || others.some(o => o.k === k)); idx.push(key);
+    try { localStorage.setItem('orion-bars-idx', JSON.stringify(idx)); } catch {}
+  };
+  try { localStorage.setItem(key, payload); commitIdx(); }
+  catch {   // quota : évince le plus ancien contexte non-courant réel puis retente UNE fois
+    try {
+      const keys = Object.keys(localStorage).filter(k => k.startsWith('orion-bars-') && k !== 'orion-bars-idx' && k !== key);
+      if (keys.length) { localStorage.removeItem(keys[0]); localStorage.setItem(key, payload); commitIdx(); }
+    } catch {}
   }
 }
 function loadPersisted() {   // renvoie {b, atStart, fi, lm, la} sain et pas trop périmé, sinon null
@@ -551,8 +577,10 @@ function loadPersisted() {   // renvoie {b, atStart, fi, lm, la} sain et pas tro
     if (!raw) return null;
     const o = JSON.parse(raw);
     if (!o || o.v !== BARS_SCHEMA || !Array.isArray(o.b) || !o.b.length) return null;
-    // trop vieux = trop de trou à combler : rechargement frais (secondes très court, klines borné à fillGap)
-    const maxAge = isSecTf() ? 90000 : 18000 * TFSEC[tfDef().src] * 1000;
+    // secondes : curseur trade indispensable (le poll ne s'amorce pas sans) — refuser un enregistrement sans 'la' valide
+    if (isSecTf() && !(typeof o.la === 'number' && o.la > 0)) return null;
+    // trop vieux = trop de trou à combler : rechargement frais (secondes très court, klines borné à fillGap ET à 30 j)
+    const maxAge = isSecTf() ? 90000 : Math.min(18000 * TFSEC[tfDef().src] * 1000, 30 * 86400e3);
     const age = Date.now() - o.t;
     if (typeof o.t !== 'number' || age < 0 || age > maxAge) return null;   // age < 0 : horloge reculée → rejeter
     let prev = -Infinity;   // validation profonde : OHLCV numérique, temps STRICTEMENT croissant
@@ -866,7 +894,7 @@ function applyBar(bar) {
     bucketVols.clear();   // nouveau seau de tête : les volumes source du précédent ne doivent JAMAIS s'y sommer
     if (candles.length > MAX_BARS + 1000) {
       candles = candles.slice(-MAX_BARS);
-      if (isSecTf()) { firstTradeId = null; oldestDone = true; }   // curseur de tête rasé : le scroll-back par trade n'a plus de repère
+      if (isSecTf()) firstTradeId = null;   // curseur de tête rasé : fetchOlderSec renvoie OLDEST (scroll gelé) sans mentir sur oldestDone
       setAll(candles); return;
     }
   } else if (bar.time === last.time) candles[candles.length - 1] = bar;
@@ -1087,8 +1115,10 @@ function startPoll(seq) {
       if (!Array.isArray(k)) { backoff = 15; failed(); return; }   // {code,msg} persistant = flux mort
       fails = 0; $('dot').classList.add('live');
       if (isSecTf()) {
-        if (k.length) applyTrades(k);            // batché par seau + idempotent par id (pas de double-compte)
-        if (k.length === 1000) fillGapSecSoon(); // page pleine = retard : on draine sans attendre le tick suivant
+        if (k.length === 1000) {   // page pleine = RATTRAPAGE (trades historiques) : pas d'alerte rétroactive
+          gapFilling = true; try { applyTrades(k); } finally { gapFilling = false; }
+          fillGapSecSoon();        // draine le reste (gardé), le prochain tick live ré-arme les alertes
+        } else if (k.length) applyTrades(k);   // lot court = à jour = LIVE : les alertes tirent normalement
       }
       else k.slice(-2).forEach(x => applyBar(x));  // seau le plus ancien du rollup potentiellement partiel : écarté
     } catch { backoff = 5; failed(); }
@@ -1140,7 +1170,7 @@ function startWs(attempt = 0) {
         const p = +d.p, tt = d.T / 1000, last = candles[candles.length - 1];
         if (isSecTf()) {
           if (lastAggId && d.a > lastAggId + 1) { if (!gapFilling) fillGapSec(); }   // trou d'ids : rattrapage REST IMMÉDIAT (idempotent, non throttlé, gardé par gapFilling) — pas d'apply inline (double-compte)
-          else { applyTrade(p, +d.q, tt); lastTradeMs = d.T; lastAggId = d.a; }
+          else if (d.a > lastAggId) { applyTrade(p, +d.q, tt); lastTradeMs = d.T; lastAggId = d.a; }   // idempotent : blindé contre un re-délivrage (reconnexion, proxy)
         }
         // borne haute : un trade de la bougie SUIVANTE ne doit jamais réécrire la bougie clôturée
         else if (tt >= last.time && tt < barEnd(last.time)) {
@@ -1649,9 +1679,10 @@ $('propDup').onclick = () => {
   const shift = o => { if (o.t != null) { const nt = tOf(lOf(o.t) + 5); if (nt != null) o.t = nt; } };
   if (c.pts) c.pts.forEach(shift);
   else { shift(c); if (c.a) shift(c.a); if (c.b) shift(c.b); }
-  if (c.type === 'hline') {
+  if (c.type === 'hline' || c.type === 'alert') {   // décale en prix (pas d'ancre temporelle) → copie visible, pas superposée
     const y = series.priceToCoordinate(c.price);
     if (y != null) c.price = series.coordinateToPrice(y + 20) ?? c.price;
+    delete c.firedAt;   // la copie repart ré-armée (sinon héritée « déjà tirée »)
   }
   if (futureHidden(c)) { toast('Impossible : la copie dépasserait la tête de lecture'); return; }   // jamais de copie invisible
   drawings.push(c); saveDrawings(); select(drawings.length - 1);
@@ -2344,9 +2375,20 @@ wrap.addEventListener('touchmove', () => { lastPointer = Date.now(); invalidate(
 document.addEventListener('mousemove', e => { if (e.buttons) { lastPointer = Date.now(); invalidate(); } });
 wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 
+let apiBanShown = '';
+function updateApiBan() {   // bandeau persistant pendant un ban 429/418 (le toast, lui, disparaît en 3 s)
+  const left = apiCoolUntil - Date.now();
+  const txt = left > 0 ? `⏳ Binance en pause ${Math.ceil(left / 1000)} s (débit dépassé)` : '';
+  if (txt !== apiBanShown) {
+    apiBanShown = txt;
+    $('apiban').textContent = txt;
+    $('apiban').hidden = !txt;
+  }
+}
 (function render() {
   if (!cvH) sizeCv();   // auto-guérison si l'observer n'a jamais tiré
   updateCountdown();
+  updateApiBan();
   if (legendHTML !== legendShown) { $('legend').innerHTML = legendShown = legendHTML; }
   if (lastPriceTxt !== lastPriceShown) { $('lastPrice').textContent = lastPriceShown = lastPriceTxt; }
   /* measure est statique une fois posée (ancrée t/prix, la vue invalide déjà) :
@@ -2451,6 +2493,8 @@ try {
 document.querySelectorAll('.tool[data-tip]').forEach(b => b.setAttribute('aria-label', b.dataset.tip));
 $('propKind').setAttribute('aria-label', 'Type de rectangle');
 $('propTf').setAttribute('aria-label', 'TF de la zone');
+$('propWidth').setAttribute('aria-label', 'Épaisseur du trait');
+$('propStyle').setAttribute('aria-label', 'Style de trait');
 $('rpSpeed').setAttribute('aria-label', 'Vitesse du replay');
 $('magnetBtn').setAttribute('aria-pressed', 'false');
 $('eyeBtn').setAttribute('aria-pressed', 'true');
