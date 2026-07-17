@@ -673,6 +673,36 @@ function fillGapSecSoon() {   // même throttle que fillGapSoon
   if (n - lastGapReq < 2000) return;
   lastGapReq = n; fillGapSec();
 }
+/* approfondit l'historique d'un TF secondes APRÈS l'affichage de la 1re page :
+   petits lots séquentiels (léger pour l'API), prepend vers la gauche en gardant
+   la fenêtre temporelle visible → aucun saut, la 1re page reste instantanée */
+async function deepenSec(seq) {   // garde seq : une boucle périmée (TF/symbole changé) se rompt sans muter
+  try {
+    const target = 500 * tfDef().sec;   // ~500 seaux visés
+    for (let g = 0; g < 8; g++) {
+      if (seq !== loadSeq || replay || !firstTradeId || firstTradeId <= 1) break;
+      if (candles[candles.length - 1].time - candles[0].time >= target) break;
+      if (candles.length >= MAX_BARS) break;
+      const { trades, healthy } = await fetchTradesBack(firstTradeId, 2);
+      if (seq !== loadSeq || replay) break;
+      if (!trades.length) { if (healthy) oldestDone = true; break; }
+      firstTradeId = trades[0].a;
+      const older = tradesToBars(trades);
+      const head = candles[0], lastNew = older[older.length - 1];
+      if (lastNew && head && lastNew.time === head.time) {   // fusion du seau frontière
+        head.open = lastNew.open;
+        if (lastNew.high > head.high) head.high = lastNew.high;
+        if (lastNew.low < head.low) head.low = lastNew.low;
+        head.volume += lastNew.volume; older.pop();
+      }
+      if (!older.length) continue;
+      const vr = ts().getVisibleRange();          // fenêtre temporelle stable à travers le prepend
+      candles = older.concat(candles);
+      setAll(candles);
+      if (vr) try { ts().setVisibleRange(vr); } catch {}
+    }
+  } catch {}
+}
 /* scroll-back des TF secondes : 5 pages de trades en arrière par déclenchement.
    'end' = genèse atteinte ; null = réessayer plus tard (erreur/contexte) */
 async function fetchOlderSec() {
@@ -838,18 +868,10 @@ async function load(keepZoom = false, attempt = 0) {
       oldestDone = cached.oldestDone;
       firstTradeId = cached.firstTradeId; lastTradeMs = cached.lastTradeMs; lastAggId = cached.lastAggId || 0;
       fromCache = true;
-    } else if (isSecTf()) {   // secondes : construit depuis les aggTrades, pagination arrière ADAPTATIVE
-      let tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
+    } else if (isSecTf()) {   // secondes : UNE seule page pour afficher VITE ; l'historique s'approfondit ensuite en arrière-plan
+      const tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
       if (seq !== loadSeq || replay) return;   // AVANT d'écrire les curseurs (un load supplanté les clobberait)
       if (Array.isArray(tr) && tr.length) {
-        const spanMs = tr[tr.length - 1].T - tr[0].T;
-        const needMs = 500 * tfDef().sec * 1000;   // couverture visée ≈ 500 seaux
-        const pages = spanMs >= needMs ? 0 : Math.min(6, Math.ceil((needMs - spanMs) / Math.max(1, spanMs)));   // plafond 6 : budget de poids API (le scroll complète)
-        if (pages && tr[0].a > 1) {
-          const { trades } = await fetchTradesBack(tr[0].a, pages);
-          if (seq !== loadSeq || replay) return;
-          tr = trades.concat(tr);
-        }
         lastTradeMs = tr[tr.length - 1].T;
         lastAggId = tr[tr.length - 1].a;
         firstTradeId = tr[0].a;
@@ -911,6 +933,8 @@ async function load(keepZoom = false, attempt = 0) {
     startWs();
     // rattrapage du trou depuis la mise en cache : APRÈS le finally (loading=false), sinon ctxBusy le tue
     if (fromCache) setTimeout(() => { if (seq === loadSeq && !replay) (isSecTf() ? fillGapSec() : fillGap()); }, 0);
+    // secondes : la 1re page est affichée ; on approfondit l'historique en tâche de fond (vers la gauche, sans saccade)
+    if (!fromCache && isSecTf()) deepenSec(seq);
   } catch (e) { if (seq === loadSeq) { toast('Réseau : ' + e.message); retry(); } }
   finally { if (seq === loadSeq) { loading = false; document.body.classList.remove('busy'); } }
 }
