@@ -1009,7 +1009,7 @@ function saveDrawings() {
 const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
 const tfOk = t => typeof t === 'string' && Object.hasOwn(TFSEC, t);   // TF de zone = 1m → 1M, aligné sur propTf
-const zLabel = t => t === '1M' ? '1MOIS' : t.toUpperCase();   // nomenclature zones : minutes en M, mensuel désambiguïsé
+const zLabel = t => t.endsWith('m') ? 'm' + parseInt(t) : t.toUpperCase();   // zones : m1…m30, 1H…12H, 1D, 3D, 1W, 1M
 function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
@@ -1220,7 +1220,7 @@ function syncPropbar() {
     $('propTf').value = r ? (r.tfk || '') : rectTf;
   }
 }
-TFS.forEach(t => {   // 1m → 1M ; nomenclature zones = MAJUSCULES (1M = minute, mensuel = 1MOIS)
+TFS.forEach(t => {   // 1m → 1M ; nomenclature zones : minutes en préfixe m (m1…m30), mensuel = 1M
   const o = document.createElement('option');
   o.value = t; o.textContent = zLabel(t);
   $('propTf').appendChild(o);
