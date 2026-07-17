@@ -355,15 +355,27 @@
   </div>
 </div>
 
-<script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"
+        integrity="sha384-8J8e9bGIwf7e9BLO5rwf4zJwNRKcypGnvuGzORD/t4TrFA1gWbl3Hsi/RvyWwBKl"
+        crossorigin="anonymous"></script>
 <script>
 const $ = id => document.getElementById(id);
+if (!window.LightweightCharts) {
+  document.getElementById('legend').textContent =
+    'Librairie graphique indisponible (CDN inaccessible ou intégrité invalide) — vérifie ta connexion et recharge.';
+  throw new Error('LightweightCharts absent');
+}
 const LWC = LightweightCharts;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const GOLD = '#d9b64d', GOLD_B = '#f0d478', GOLD_D = '#8a6d2f';
 const REST = 'https://fapi.binance.com/fapi/v1/klines';
 const WSS  = 'wss://fstream.binance.com/stream';
 const TFSEC = { '1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'8h':28800,'12h':43200,'1d':86400,'3d':259200,'1w':604800,'1M':2592000 };
 const TFS = Object.keys(TFSEC);
+const barEnd = t0 => {   // clôture réelle de la bougie ouverte à t0 (mois calendaire pour 1M)
+  if (tf === '1M') { const d = new Date(t0 * 1000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000; }
+  return t0 + (TFSEC[tf] || 60);
+};
 const tfLabel = t => /[dw]$/.test(t) ? t.toUpperCase() : t;
 const SYMBOLS = [
   ['BTCUSDT','Bitcoin'], ['ETHUSDT','Ethereum'], ['BNBUSDT','BNB'], ['SOLUSDT','Solana'],
@@ -452,7 +464,8 @@ function applyTheme(t, save = true) {
     grid: { vertLines: { color: theme.grid }, horzLines: { color: theme.grid } },
   });
   series.applyOptions({ upColor: theme.up, borderUpColor: theme.up, wickUpColor: theme.up, downColor: theme.down, borderDownColor: theme.downLine, wickDownColor: theme.downLine });
-  if (candles.length && !replay) volSeries.setData(candles.map(volOf));
+  const src = dataNow();                              // recolore aussi le volume affiché en replay
+  if (src.length) volSeries.setData(src.map(volOf));
   $('thBg').value = theme.bg; $('thGrid').value = theme.grid; $('thUp').value = theme.up; $('thDown').value = theme.down;
   if (save) try { localStorage.setItem('orion-theme', JSON.stringify(theme)); } catch {}
 }
@@ -483,23 +496,51 @@ function refreshTop() {
 }
 function applyBar(bar) {
   const last = candles[candles.length - 1];
-  if (bar.time > last.time) candles.push(bar);
-  else if (bar.time === last.time) candles[candles.length - 1] = bar;
+  if (bar.time > last.time) {
+    if (bar.time > barEnd(last.time)) { fillGap(); return; }   // trou (veille, coupure) → rattrapage REST
+    candles.push(bar);
+    if (candles.length > 21000) { candles = candles.slice(-20000); setAll(candles); return; }
+  } else if (bar.time === last.time) candles[candles.length - 1] = bar;
   else return;
   series.update(bar); volSeries.update(volOf(bar));
   computeInd(); refreshTop(); invalidate();
 }
 
+/* rattrape les bougies manquantes entre la dernière connue et maintenant */
+let gapFilling = false;
+async function fillGap() {
+  if (gapFilling || !candles.length) return;
+  gapFilling = true;
+  const seq = loadSeq;
+  try {
+    for (let round = 0; round < 20; round++) {
+      const from = candles[candles.length - 1].time * 1000 + 1;
+      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&startTime=${from}&limit=1000`)).json();
+      if (seq !== loadSeq || replay || !Array.isArray(k) || !k.length) break;
+      k.map(mapK).forEach(b => {
+        if (b.time > candles[candles.length - 1].time) {
+          candles.push(b);
+          series.update(b); volSeries.update(volOf(b));
+        }
+      });
+      computeInd(); refreshTop(); invalidate();
+      if (k.length < 1000) break;
+    }
+  } catch {} finally { gapFilling = false; }
+}
+
+let loading = false;
 async function load() {
   const seq = ++loadSeq;
+  loading = true;
   stopWs();
   oldestDone = false;
   $('dot').classList.remove('live');
   try {
     const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500`);
     const k = await r.json();
-    if (seq !== loadSeq) return;
-    if (!Array.isArray(k)) { toast(`Binance Futures : ${k.msg || 'symbole invalide'}`); return; }
+    if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
+    if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); return; }
     candles = k.map(mapK);
     setPrecision(candles.at(-1).close);
     setAll(candles);
@@ -507,32 +548,40 @@ async function load() {
     refreshTop();
     startWs();
   } catch (e) { if (seq === loadSeq) toast('Réseau : ' + e.message); }
+  finally { if (seq === loadSeq) loading = false; }
 }
 
+let pollTimer = null, reconnectTimer = null, staleTimer = null, lastMsgAt = 0;
 function stopWs() {
   if (ws) { try { ws.close(); } catch {} ws = null; }   // pas de reconnexion : loadSeq a déjà tourné
   clearInterval(pollTimer); pollTimer = null;
+  clearTimeout(reconnectTimer); reconnectTimer = null;
+  clearInterval(staleTimer); staleTimer = null;
 }
 
-/* fallback REST : le WS futures peut être muet (bloqué) → on polle les 2 dernières bougies */
-let pollTimer = null;
+/* fallback REST : WS injoignable ou muet → on polle les 2 dernières bougies */
 function startPoll(seq) {
   if (pollTimer || seq !== loadSeq) return;
   $('dot').classList.add('live');
-  fetch('https://fapi.binance.com/fapi/v1/time').then(r => r.json())
+  const syncClock = () => fetch('https://fapi.binance.com/fapi/v1/time').then(r => r.json())
     .then(j => { if (j.serverTime) clockOff = j.serverTime - Date.now(); }).catch(() => {});
+  syncClock();
+  let backoff = 0, ticks = 0;
   pollTimer = setInterval(async () => {
     if (seq !== loadSeq) return;
     if (replay || !candles.length) return;
+    if (backoff > 0) { backoff--; return; }              // recul après erreur (429, réseau…)
+    if (++ticks % 30 === 0) syncClock();                 // resynchronise l'horloge toutes les ~60 s
     try {
       const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=2`)).json();
-      if (seq !== loadSeq || !Array.isArray(k) || !candles.length) return;
+      if (seq !== loadSeq || !candles.length) return;
+      if (!Array.isArray(k)) { backoff = 15; return; }   // {code,msg} → pause 30 s
       k.forEach(x => applyBar(mapK(x)));
-    } catch {}
+    } catch { backoff = 5; }
   }, 2000);
 }
 
-function startWs() {
+function startWs(attempt = 0) {
   const s = symbol.toLowerCase(), seq = loadSeq;
   let gotMsg = false, muted = false;
   ws = new WebSocket(`${WSS}?streams=${s}@aggTrade/${s}@kline_${tf}`);
@@ -543,30 +592,47 @@ function startWs() {
       startPoll(seq);
     }
   }, 6000);
+  /* flux mort en cours de session (veille, NAT) : silence > 15 s → recycle en polling */
+  clearInterval(staleTimer);
+  staleTimer = setInterval(() => {
+    if (seq !== loadSeq || pollTimer) return;
+    if (gotMsg && Date.now() - lastMsgAt > 15000) {
+      muted = true;
+      if (ws) { try { ws.close(); } catch {} ws = null; }
+      startPoll(seq);
+    }
+  }, 5000);
   ws.onopen = () => $('dot').classList.add('live');
   ws.onclose = () => {
     clearTimeout(watchdog);
     if (!pollTimer) $('dot').classList.remove('live');
-    if (!muted && seq === loadSeq) setTimeout(() => seq === loadSeq && startWs(), 2000);
+    if (muted || seq !== loadSeq) return;
+    if (!gotMsg && attempt >= 1) { startPoll(seq); return; }   // 2 connexions mortes → polling
+    reconnectTimer = setTimeout(() => {
+      if (seq === loadSeq && !pollTimer) startWs(gotMsg ? 0 : attempt + 1);
+    }, 2000);
   };
   ws.onmessage = e => {
-    gotMsg = true;
-    const { stream, data: d } = JSON.parse(e.data);
-    if (d.E) clockOff = d.E - Date.now();          // resynchronise l'horloge sur Binance
-    if (replay || !candles.length) return;
-    if (stream.endsWith('aggTrade')) {
-      const p = +d.p, last = candles[candles.length - 1];
-      if (d.T / 1000 >= last.time) {
-        last.close = p;
-        if (p > last.high) last.high = p;
-        if (p < last.low) last.low = p;
-        series.update(last);
-        refreshTop(); invalidate();
+    try {
+      gotMsg = true; lastMsgAt = Date.now();
+      const { stream, data: d } = JSON.parse(e.data);
+      if (d.E) clockOff = d.E - Date.now();          // resynchronise l'horloge sur Binance
+      if (replay || !candles.length) return;
+      if (stream.endsWith('aggTrade')) {
+        const p = +d.p, tt = d.T / 1000, last = candles[candles.length - 1];
+        // borne haute : un trade de la bougie SUIVANTE ne doit jamais réécrire la bougie clôturée
+        if (tt >= last.time && tt < barEnd(last.time)) {
+          last.close = p;
+          if (p > last.high) last.high = p;
+          if (p < last.low) last.low = p;
+          series.update(last);
+          refreshTop(); invalidate();
+        }
+      } else {
+        const k = d.k;
+        applyBar({ time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v });
       }
-    } else {
-      const k = d.k;
-      applyBar({ time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v });
-    }
+    } catch {}
   };
 }
 
@@ -577,7 +643,7 @@ function legend(bar, vol, atrV) {
   const cls = pct >= 0 ? 'up' : 'dn';
   const a = atrV !== undefined ? atrV : lastAtr;
   $('legend').innerHTML =
-    `<b>${symbol}</b> · Perp · ${tfLabel(tf)}${replay ? ' · <span style="color:#f0d478">REPLAY</span>' : ''}<br>` +
+    `<b>${esc(symbol)}</b> · Perp · ${tfLabel(tf)}${replay ? ' · <span style="color:#f0d478">REPLAY</span>' : ''}<br>` +
     `O <span class="${cls}">${fmt(bar.open)}</span>  H <span class="${cls}">${fmt(bar.high)}</span>  ` +
     `L <span class="${cls}">${fmt(bar.low)}</span>  C <span class="${cls}">${fmt(bar.close)}</span>  ` +
     `<span class="${cls}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</span>` +
@@ -612,12 +678,16 @@ TFS.forEach(t => {
 });
 
 /* ---------- symboles ---------- */
-function setSymbol(v) {
+async function setSymbol(v) {
   if (!v || v === symbol) { $('symPanel').hidden = true; return; }
+  $('symPanel').hidden = true;
+  try {                                          // valider AVANT de toucher l'état
+    const k = await (await fetch(`${REST}?symbol=${encodeURIComponent(v)}&interval=${tf}&limit=1`)).json();
+    if (!Array.isArray(k) || !k.length) { toast(`Symbole invalide : ${v}`); return; }
+  } catch { toast('Réseau : symbole non vérifié, réessaie'); return; }
   if (replay) exitReplay(false);
   symbol = v;
   $('symBtn').textContent = v + ' ▾';
-  $('symPanel').hidden = true;
   loadDrawings();                                // tracés propres à chaque symbole (localStorage)
   load();
 }
@@ -649,16 +719,25 @@ document.addEventListener('mousedown', e => {   // fermeture au clic extérieur 
 });
 
 /* ---------- replay ---------- */
+let replayLoading = false;
 async function enterReplay() {
-  const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=1000`);
-  const k = await r.json();
-  if (!Array.isArray(k)) { toast('Replay : historique indisponible'); return; }
-  replay = { data: k.map(mapK), i: k.length - 1, playing: false, timer: null, picking: true };
-  setAll(replay.data);
-  $('replayBtn').classList.add('on');
-  $('replaybar').hidden = false; $('hint').hidden = false;
-  select(null);
-  legend(replay.data[replay.i]);
+  if (replay || replayLoading) return;
+  replayLoading = true;
+  const seq = loadSeq;
+  try {
+    const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=1000`);
+    const k = await r.json();
+    if (seq !== loadSeq || replay) return;       // symbole/TF changé pendant le fetch
+    if (!Array.isArray(k) || !k.length) { toast('Replay : historique indisponible'); return; }
+    resetTool();                                 // le pick se fait toujours au curseur
+    replay = { data: k.map(mapK), i: k.length - 1, playing: false, timer: null, picking: true };
+    setAll(replay.data);
+    $('replayBtn').classList.add('on');
+    $('replaybar').hidden = false; $('hint').hidden = false;
+    select(null);
+    legend(replay.data[replay.i]);
+  } catch (e) { toast('Replay : ' + e.message); }
+  finally { replayLoading = false; }
 }
 function pickAt(time) {
   const i = replay.data.findIndex(d => d.time === time);
@@ -695,6 +774,7 @@ function exitReplay(reload = true) {
   rpPause(); replay = null; curtainX = null;
   $('replayBtn').classList.remove('on');
   $('replaybar').hidden = true; $('hint').hidden = true;
+  if (!$('propbar').hidden) $('propbar').style.top = '12px';   // la propbar suit la replaybar
   if (reload) load();
 }
 $('replayBtn').onclick = () => replay ? exitReplay() : enterReplay();
@@ -708,7 +788,7 @@ $('rpPick').onclick = () => {
   $('hint').hidden = false;
 };
 chart.subscribeClick(p => {
-  measure = null;
+  if (measure) { measure = null; invalidate(); }
   if (replay && replay.picking && p.time) pickAt(p.time);
 });
 
@@ -716,14 +796,20 @@ chart.subscribeClick(p => {
 const cv = $('overlay'), ctx = cv.getContext('2d');
 const wrap = $('chartwrap');
 let cvW = 0, cvH = 0;   // dimensions CSS du canvas, mises en cache (pas de lecture layout par frame)
-new ResizeObserver(() => {
+function sizeCv() {
   const r = wrap.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  if (!r.width || !r.height) return;
+  if (r.width === cvW && r.height === cvH) return;
   cvW = r.width; cvH = r.height;
   cv.width = r.width * dpr; cv.height = r.height * dpr;
   cv.style.width = r.width + 'px'; cv.style.height = r.height + 'px';
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   invalidate();
-}).observe(wrap);
+}
+/* RO peut ne jamais délivrer selon l'environnement : triple ceinture
+   (appel initial en bas de script, événement resize, auto-guérison dans render) */
+new ResizeObserver(sizeCv).observe(wrap);
+window.addEventListener('resize', sizeCv);
 
 const paneW = () => ts().width();
 const paneH = () => cvH - ts().height();
@@ -767,7 +853,14 @@ function saveDrawings() {
   invalidate();   // toute mutation de tracé passe par ici → redessine
 }
 function loadDrawings() {
-  try { drawings = JSON.parse(localStorage.getItem('orion-draw-' + symbol)) || []; } catch { drawings = []; }
+  try {
+    const arr = JSON.parse(localStorage.getItem('orion-draw-' + symbol)) || [];
+    drawings = arr.filter(d => d && d.type && (   // écarte les entrées corrompues / ancien schéma {l}
+      d.type === 'hline' ? d.price != null :
+      d.pts ? d.pts.length && d.pts[0].t != null :
+      d.a ? d.a.t != null :
+      d.t != null));
+  } catch { drawings = []; }
   resetTransient(); invalidate();
 }
 
@@ -824,10 +917,10 @@ function markTool(name) {
 document.querySelectorAll('.tool[data-tool]').forEach(b => b.onclick = () => {
   tool = b.dataset.tool;
   markTool(tool);
-  cv.style.pointerEvents = tool === 'cursor' ? 'none' : 'auto';
-  cv.style.cursor = tool === 'eraser' ? 'not-allowed' : 'crosshair';
+  temp = null; measure = null; invalidate();   // un canal en attente ne survit pas au changement d'outil
+  wrap.style.cursor = tool === 'cursor' ? '' : tool === 'eraser' ? 'not-allowed' : 'crosshair';
   hideTxtIn();
-  if (tool !== 'cursor') { sel = null; invalidate(); showPropbar(tool !== 'eraser'); }
+  if (tool !== 'cursor') { sel = null; showPropbar(tool !== 'eraser'); }
   else showPropbar(false);
 });
 function showPropbar(v) {
@@ -837,7 +930,7 @@ function showPropbar(v) {
 function resetTool() {
   tool = 'cursor'; temp = null; hideTxtIn();
   markTool('cursor');
-  cv.style.pointerEvents = 'none';
+  wrap.style.cursor = '';
   showPropbar(sel != null);
 }
 function commit(d) {   // rituel de fin de tracé
@@ -857,12 +950,24 @@ $('eyeBtn').onclick = () => {
   if (!showDraw) select(null);
   invalidate();
 };
-$('undoBtn').onclick = () => { drawings.pop(); saveDrawings(); select(null); };
+$('undoBtn').onclick = () => {
+  drawings.pop(); saveDrawings(); select(null);
+  if (tool !== 'cursor' && tool !== 'eraser') showPropbar(true);   // l'outil reste armé → la barre reste
+};
 $('clearBtn').onclick = () => clearDrawings();
 document.addEventListener('keydown', e => {
   const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
-  if (e.key === 'Escape') { resetTool(); measure = null; select(null); $('ctxMenu').hidden = true; invalidate(); }
-  if ((e.key === 'Delete' || e.key === 'Backspace') && sel != null && !typing) deleteDrawing(sel);
+  if (e.key === 'Escape') {
+    $('ctxMenu').hidden = true; $('symPanel').hidden = true;
+    if (typing) { document.activeElement.blur(); return; }   // en saisie : on ferme, on ne désarme rien
+    if (drag) {                                              // annule le drag : restaure la géométrie d'origine
+      drawings[drag.i] = drag.orig;
+      drag = null; wrap.style.cursor = ''; invalidate();
+      return;
+    }
+    resetTool(); measure = null; select(null); invalidate();
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && sel != null && !typing && !drag) deleteDrawing(sel);
 });
 
 /* --- barre de propriétés --- */
@@ -918,14 +1023,25 @@ function openTxtIn(clientX, clientY, value = '') {
   t.value = value;
   setTimeout(() => t.focus(), 0);
 }
-$('txtIn').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && e.target.value.trim()) {
-    if (editIdx != null) drawings[editIdx].text = e.target.value.trim();
-    else if (txtPos) drawings.push({ type: 'text', ...txtPos, ...defaultStyle, text: e.target.value.trim() });
+function commitTxtIn() {   // valide le texte en cours (Entrée, blur, ou re-clic ailleurs)
+  const t = $('txtIn');
+  if (t.style.display === 'none') return;
+  const v = t.value.trim();
+  if (v) {
+    if (editIdx != null) drawings[editIdx].text = v;
+    else if (txtPos) drawings.push({ type: 'text', ...txtPos, ...defaultStyle, text: v });
     saveDrawings();
-    hideTxtIn(); resetTool();
   }
+  hideTxtIn();
+}
+$('txtIn').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { commitTxtIn(); resetTool(); }
   if (e.key === 'Escape') { hideTxtIn(); resetTool(); }
+});
+$('txtIn').addEventListener('blur', () => {
+  if ($('txtIn').style.display === 'none') return;
+  commitTxtIn();
+  if (tool === 'text') resetTool();
 });
 
 /* --- création de tracés (outils actifs, canvas capte la souris) --- */
@@ -934,9 +1050,18 @@ function chPriceAt(d, t) {   // prix de la ligne de base du canal au temps t
   if (la == null || lb == null || lt == null || la === lb) return d.a.price;
   return d.a.price + (d.b.price - d.a.price) * (lt - la) / (lb - la);
 }
-cv.addEventListener('mousedown', e => {
+/* les outils écoutent en phase capture sur le conteneur : le chart garde crosshair,
+   zoom, pan et axes vivants ; on n'intercepte que le clic gauche utile dans le pane */
+let toolDown = false;
+wrap.addEventListener('mousedown', e => {
+  if (tool === 'cursor' || e.button !== 0 || uiGuard(e)) return;
+  const m = mpos(e);
+  if (m.x > paneW() || m.y > paneH()) return;            // clic sur un axe → comportement natif LWC
+  if (!showDraw) { toast('Tracés masqués — clique l’œil pour les réafficher'); return; }
   const p = snap(lpt(e));
   if (p.price == null) return;
+  e.preventDefault(); e.stopPropagation();               // pas de pan pendant qu'on trace
+  toolDown = true;
   if (temp && temp.type === 'channel' && temp.phase === 2) {   // 3e clic : valide la parallèle
     delete temp.phase;
     const d = temp; temp = null;
@@ -949,9 +1074,8 @@ cv.addEventListener('mousedown', e => {
   if (p.t == null) return;
   if (tool === 'vline') { commit({ type: 'vline', t: p.t, ...st }); return; }
   if (tool === 'hray')  { commit({ type: 'hray', t: p.t, price: p.price, ...st }); return; }
-  if (tool === 'text')  { txtPos = p; openTxtIn(e.clientX, e.clientY); return; }
+  if (tool === 'text')  { commitTxtIn(); txtPos = p; openTxtIn(e.clientX, e.clientY); return; }
   if (tool === 'eraser') {
-    const m = mpos(e);
     const ht = hitTest(m.x, m.y);
     if (ht) deleteDrawing(ht.i);
     return;
@@ -961,8 +1085,8 @@ cv.addEventListener('mousedown', e => {
   if (tool === 'long' || tool === 'short') { temp = { type: tool, a: p, b: { t: p.t }, target: p.price, stop: p.price, ...st }; return; }
   if (AB_TYPES.includes(tool))
     temp = { type: tool, a: p, b: p, ...st };
-});
-cv.addEventListener('mousemove', e => {
+}, true);
+document.addEventListener('mousemove', e => {
   if (!temp) return;
   const p = snap(lpt(e));
   if (p.t == null || p.price == null) return;
@@ -975,7 +1099,9 @@ cv.addEventListener('mousemove', e => {
     temp.b = { t: p.t }; temp.target = p.price;
   } else temp.b = p;
 });
-cv.addEventListener('mouseup', () => {
+document.addEventListener('mouseup', () => {
+  if (!toolDown) return;
+  toolDown = false;
   if (temp) {
     if (temp.type === 'channel') {
       if (temp.phase === 1) { temp.phase = 2; return; }    // on garde l'outil : la souris règle la parallèle
@@ -1109,11 +1235,11 @@ wrap.addEventListener('contextmenu', e => {
   e.preventDefault();
   const m = $('ctxMenu'), r = wrap.getBoundingClientRect();
   m.hidden = false;
-  m.style.left = Math.max(0, Math.min(e.clientX - r.left, r.width - 200)) + 'px';
-  m.style.top = Math.max(0, Math.min(e.clientY - r.top, r.height - 250)) + 'px';
+  m.style.left = Math.max(0, Math.min(e.clientX - r.left, r.width - m.offsetWidth - 4)) + 'px';
+  m.style.top = Math.max(0, Math.min(e.clientY - r.top, r.height - m.offsetHeight - 4)) + 'px';
 });
 wrap.addEventListener('mousedown', e => {
-  if (tool !== 'cursor' || !showDraw || uiGuard(e)) return;
+  if (tool !== 'cursor' || e.button !== 0 || !showDraw || uiGuard(e)) return;
   const m = mpos(e);
   const ht = hitTest(m.x, m.y);
   if (ht) {
@@ -1315,16 +1441,10 @@ function drawOne(d, isSel) {
 function barCloseTs() {
   if (!candles.length) return null;
   const now = (Date.now() + clockOff) / 1000;
-  const t0 = candles[candles.length - 1].time;
-  if (tf === '1M') {
-    const d = new Date(t0 * 1000);
-    let m = d.getUTCMonth() + 1, c = Date.UTC(d.getUTCFullYear(), m, 1) / 1000;
-    while (c <= now) { m++; c = Date.UTC(d.getUTCFullYear(), m, 1) / 1000; }
-    return c;
-  }
-  const sec = TFSEC[tf] || 60;
-  // ancré sur l'ouverture réelle, mais roule immédiatement sur l'intervalle suivant à l'échéance
-  return t0 + sec * (Math.floor(Math.max(0, now - t0) / sec) + 1);
+  // ancré sur l'ouverture réelle, roule immédiatement sur l'intervalle suivant à l'échéance
+  let c = barEnd(candles[candles.length - 1].time);
+  for (let g = 0; c <= now && g < 100000; g++) c = barEnd(c);
+  return c;
 }
 /* refs et cache : aucune lecture/écriture DOM superflue à 60 fps */
 const cdEl = $('countdown'), cdP = cdEl.querySelector('.cdP'), cdT = cdEl.querySelector('.cdT');
@@ -1358,10 +1478,11 @@ function updateCountdown() {
 /* invalidations : tout ce qui peut déplacer les tracés à l'écran */
 ts().subscribeVisibleTimeRangeChange(invalidate);            // pan / zoom / nouvelles bougies
 wrap.addEventListener('wheel', invalidate, { passive: true }); // zoom sur l'axe des prix
-wrap.addEventListener('mousemove', e => { if (e.buttons) invalidate(); }); // drag d'un axe
+document.addEventListener('mousemove', e => { if (e.buttons) invalidate(); }); // drag d'axe même hors fenêtre
 wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 
 (function render() {
+  if (!cvH) sizeCv();   // auto-guérison si l'observer n'a jamais tiré
   updateCountdown();
   if (dirty || drag || temp || measure || (replay && replay.picking)) {
     dirty = false;
@@ -1388,13 +1509,13 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 
 /* --- bougies du passé : chargement auto en scrollant vers la gauche --- */
 ts().subscribeVisibleLogicalRangeChange(async r => {
-  if (!r || r.from > 30 || replay || loadingOld || oldestDone || !candles.length) return;
+  if (!r || r.from > 30 || replay || loading || loadingOld || oldestDone || !candles.length) return;
   loadingOld = true;
   const seq = loadSeq;
   try {
     const resp = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500&endTime=${candles[0].time * 1000 - 1}`);
     const k = await resp.json();
-    if (seq !== loadSeq || !Array.isArray(k)) return;
+    if (seq !== loadSeq || replay || loading || !Array.isArray(k)) return;   // supplanté pendant le fetch
     const first = candles[0].time;
     const older = k.filter(x => x[0] / 1000 < first);
     if (!older.length) { oldestDone = true; return; }
@@ -1406,8 +1527,10 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
 
 try {
   const st = JSON.parse(localStorage.getItem('orion-theme'));
-  applyTheme(st && st.bg ? st : { ...THEMES.or }, false);
+  const valid = st && st.bg && st.grid && st.up && st.down;   // schéma complet, sinon défaut
+  applyTheme(valid ? st : { ...THEMES.or }, false);
 } catch { applyTheme({ ...THEMES.or }, false); }
+sizeCv();
 syncPropbar();
 loadDrawings();
 load();
