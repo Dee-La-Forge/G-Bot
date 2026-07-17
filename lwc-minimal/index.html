@@ -1630,9 +1630,12 @@ function drawOne(d, isSel) {
   ctx.setLineDash(DASHES[d.dash] || []);
   ctx.fillStyle = hexToRgba(col, .10);
   ctx.font = '10px Segoe UI';
-  /* glow futuriste sur TOUS les outils de tracé (demande Meddy), renforcé à la sélection ;
-     coupé pendant les interactions continues (hudGlow) pour préserver le pan */
-  ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 12 : 6) : 0;
+  /* glow futuriste sur les rectangles de type et les outils de tracé (demande Meddy),
+     renforcé à la sélection ; coupé pendant les interactions continues (hudGlow).
+     EXCLUS : long/short et la règle (multicolores — un halo doré les salirait) */
+  const noGlow = d.type === 'long' || d.type === 'short' || d.type === 'measure';
+  ctx.shadowColor = col;
+  ctx.shadowBlur = hudGlow && (!noGlow || isSel) ? (isSel ? 12 : 6) : 0;
   if (d.type === 'hline') {
     const y = series.priceToCoordinate(d.price);
     if (y != null) {
