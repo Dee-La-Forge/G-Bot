@@ -384,6 +384,7 @@ const GOLD = '#d9b64d', GOLD_B = '#f0d478', GOLD_D = '#8a6d2f';
 const REST = 'https://fapi.binance.com/fapi/v1/klines';
 const WSS  = 'wss://fstream.binance.com/stream';
 const SYM_RE = /^[A-Z0-9_]{2,20}$/;   // format symbole — source unique (setSymbol + restauration)
+const TEXT_MAX = 500, PTS_MAX = 3000; // bornes des tracés — source unique (création, validation, chargement)
 const fetchJson = (url, ms = 10000) => fetch(url, { signal: AbortSignal.timeout(ms) }).then(r => r.json());
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 const TFSEC = { '1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'8h':28800,'12h':43200,'1d':86400,'3d':259200,'1w':604800,'1M':2592000 };
@@ -415,6 +416,7 @@ let candles = [];
 let ws = null, loadSeq = 0;
 let dataCtx = '';   // contexte des candles chargées ; ≠ symbol|tf courant pendant un backoff = données périmées
 const ctxFresh = () => dataCtx === symbol + '|' + tf;
+const ctxBusy = () => loading || !ctxFresh();   // données absentes, en cours, ou d'un autre contexte
 let replay = null;
 let curtainX = null;
 let oldestDone = false, loadingOld = false;
@@ -453,8 +455,9 @@ const atrSeries = chart.addSeries(LWC.LineSeries, {
   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
 });
 atrSeries.priceScale().applyOptions({ scaleMargins: { top: .93, bottom: .01 } });
-let lastAtr = null, indTrs = [], indSum = 0, indStale = false;
+let lastAtr = null, indTrs = [], indSum = 0, indStale = false, indTimer = null, indSince = 0;
 function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chemin par-bougie passe par updateInd
+  clearTimeout(indTimer); indTimer = null;   // le nettoyeur annule le déclencheur : pas de recompute orphelin
   indStale = false;
   const src = dataNow();
   const atr = [];
@@ -471,7 +474,10 @@ function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chem
   lastAtr = atr.length ? atr[atr.length - 1].value : null;
 }
 function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bougie (somme glissante persistée)
-  if (indStale) return;   // fenêtre désalignée après un prepend différé : computeInd arrive dans 400 ms
+  if (indStale) {   // fenêtre désalignée après un prepend différé
+    if (Date.now() - indSince > 1500) computeInd();   // onglet throttlé : le timer peut ne jamais venir
+    return;
+  }
   const tr = prev
     ? Math.max(bar.high - bar.low, Math.abs(bar.high - prev.close), Math.abs(bar.low - prev.close))
     : bar.high - bar.low;
@@ -487,7 +493,8 @@ function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bo
     atrSeries.update({ time: bar.time, value: lastAtr });
   }
 }
-const volColor = (o, c) => c >= o ? hexToRgba(theme.up, .35) : hexToRgba(theme.downLine, .25);
+let volUp = 'rgba(217,182,77,.35)', volDn = 'rgba(138,109,47,.25)';   // recalculées par applyTheme
+const volColor = (o, c) => c >= o ? volUp : volDn;   // pas de hexToRgba par bougie (50k allocations/tranche)
 const ts = () => chart.timeScale();
 
 /* ---------- thème du graphique (clic droit) ---------- */
@@ -501,6 +508,7 @@ let theme = { ...THEMES.or };
 const lum = hex => { const n = parseInt(hex.slice(1), 16); return (.299 * (n >> 16 & 255) + .587 * (n >> 8 & 255) + .114 * (n & 255)) / 255; };
 function applyTheme(t, save = true) {
   theme = { ...t, downLine: t.downLine ?? t.down };   // downLine toujours défini pour les consommateurs
+  volUp = hexToRgba(theme.up, .35); volDn = hexToRgba(theme.downLine, .25);
   const light = lum(theme.bg) > .5;
   chart.applyOptions({
     layout: { background: { color: theme.bg }, textColor: light ? '#5a5346' : '#9d8a52' },
@@ -528,25 +536,29 @@ const mapK = x => ({ time: x[0] / 1000, open: +x[1], high: +x[2], low: +x[3], cl
 const volOf = b => ({ time: b.time, value: b.volume, color: volColor(b.open, b.close) });
 
 /* pipeline commun : (re)pose les deux séries + indicateur ; fusionne une bougie entrante */
+function postSeries(arr) { series.setData(arr); volSeries.setData(arr.map(volOf)); }
 function setAll(arr) {
-  series.setData(arr); volSeries.setData(arr.map(volOf));
+  postSeries(arr);
   computeInd(); invalidate();
 }
 /* prepend massif (scroll-back) : bougies+volume tout de suite, mais l'ATR — O(n) + setData
-   intégral — attend la fin du scroll au lieu de repayer 50 000 points à chaque tranche */
-let indTimer = null;
+   intégral — attend la fin du scroll au lieu de repayer 50 000 points à chaque tranche ;
+   fenêtre bornée à ~1 s pour qu'un scroll continu ne laisse pas l'ATR absent indéfiniment */
 function setAllDeferInd(arr) {
-  series.setData(arr); volSeries.setData(arr.map(volOf));
+  postSeries(arr);
+  if (!indStale) indSince = Date.now();
   indStale = true;
   clearTimeout(indTimer);
-  indTimer = setTimeout(computeInd, 400);
+  if (Date.now() - indSince > 1000) computeInd();
+  else indTimer = setTimeout(computeInd, 400);
   invalidate();
 }
 function refreshTop() {
   const c = candles[candles.length - 1];
   if (!c) return;
   lastPriceTxt = fmt(c.close);   // appliqué au DOM dans le rAF (chemin chaud : 1 écriture/trade sinon)
-  if (!hoverBar || hoverT === c.time) legend(c);   // survol d'une bougie HISTORIQUE seulement : la live continue de vivre
+  if (hoverT == null) legend(c);
+  else if (hoverT === c.time) legend(c, c.volume);   // survol de la bougie LIVE : elle vit, champ V compris
 }
 function applyBar(bar) {
   const last = candles[candles.length - 1];
@@ -562,12 +574,14 @@ function applyBar(bar) {
   refreshTop(); invalidate();
 }
 
-/* bougies plus anciennes que la tête de série ; null si contexte périmé pendant l'await
-   (seq bumpé, tête déplacée par un cap-slice) — LA source unique du prepend (replay + scroll-back) */
-async function fetchOlder(limit) {
+/* bougies plus anciennes que la tête de série — LA source unique du prepend (replay + scroll-back).
+   'err' = erreur API ({code,msg} : 429/418/-1121) à distinguer du contexte périmé (null :
+   seq bumpé, contexte changé, tête déplacée par un cap-slice) */
+async function fetchOlder(limit, ms = 10000) {
   const seq = loadSeq, endT = candles[0].time * 1000 - 1;
-  const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=${limit}&endTime=${endT}`);
-  if (seq !== loadSeq || !Array.isArray(k) || !candles.length || candles[0].time * 1000 - 1 !== endT) return null;
+  const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=${limit}&endTime=${endT}`, ms);
+  if (!Array.isArray(k)) return 'err';
+  if (seq !== loadSeq || !ctxFresh() || !candles.length || candles[0].time * 1000 - 1 !== endT) return null;
   const first = candles[0].time;
   return k.map(mapK).filter(b => b.time < first);
 }
@@ -580,7 +594,7 @@ function fillGapSoon() {   // throttle : au plus une tentative toutes les 2 s (a
   lastGapReq = n; fillGap();
 }
 async function fillGap() {
-  if (gapFilling || loading || (retryTimer && !ctxFresh()) || !candles.length) return;
+  if (gapFilling || ctxBusy() || !candles.length) return;
   gapFilling = true;
   const seq = loadSeq;
   try {
@@ -617,7 +631,7 @@ async function load(keepZoom = false, attempt = 0) {
   clearTimeout(retryTimer); retryTimer = null;
   stopWs();
   oldestDone = false;
-  hoverBar = false;   // nouveau contexte : la légende live reprend la main
+  hoverT = null;   // nouveau contexte : la légende live reprend la main
   $('dot').classList.remove('live');
   const retry = () => {   // échec ≠ app morte : backoff 5 s → 30 s tant que rien ne nous a supplantés
     retryTimer = setTimeout(() => { if (seq === loadSeq && !replay) load(keepZoom, attempt + 1); },
@@ -750,13 +764,13 @@ function legend(bar, vol, atrV) {
 $('chartwrap').addEventListener('mousemove', e => {
   if (replay && replay.picking) curtainX = mpos(e).x;
 });
-$('chartwrap').addEventListener('mouseleave', () => { curtainX = null; hoverBar = false; });
-let hoverBar = false, hoverT = null;   // crosshair posé sur une bougie → la légende live ne doit pas l'écraser
+$('chartwrap').addEventListener('mouseleave', () => { curtainX = null; hoverT = null; });
+let hoverT = null;   // time de la bougie survolée (null = pas de survol) → la légende live ne l'écrase pas
 chart.subscribeCrosshairMove(p => {
   const bar = p.seriesData.get(series);
   const v = p.seriesData.get(volSeries);
   const av = p.seriesData.get(atrSeries);
-  hoverBar = !!bar; hoverT = bar ? bar.time : null;
+  hoverT = bar ? bar.time : null;
   if (bar) legend(bar, v && v.value, av ? av.value : null);
   else legend(curBar());
 });
@@ -830,17 +844,18 @@ async function enterReplay() {
   if (!candles.length) { toast('Replay : données pas encore chargées'); return; }
   // bloqué seulement si les candles ne correspondent PAS au contexte courant (chimère) :
   // hors-ligne sur le même symbole/TF, le replay reste utilisable (il n'a pas besoin du réseau)
-  if (loading || (retryTimer && !ctxFresh())) { toast('Replay : chargement en cours, réessaie'); return; }
+  if (ctxBusy()) { toast('Replay : chargement en cours, réessaie'); return; }
   replayLoading = true;
   const seq = loadSeq;
   try {
     /* le replay rejoue les bougies DÉJÀ chargées : tout l'historique parcouru au
        scroll est pickable, et l'entrée ne déplace pas la vue (mêmes données).
        On complète seulement si on en a peu (page fraîche = 500). */
-    if (candles.length < 1500) {   // marge de pick sur page fraîche
-      const older = await fetchOlder(1000);
-      if (seq !== loadSeq || replay) return;     // symbole/TF changé pendant le fetch
-      if (older && older.length) candles = older.concat(candles);
+    if (candles.length < 1500) {   // marge de pick sur page fraîche — BEST-EFFORT : hors-ligne, on entre quand même
+      let older = null;
+      try { older = await fetchOlder(1000, 4000); } catch {}
+      if (seq !== loadSeq) return;               // symbole/TF changé pendant le fetch
+      if (Array.isArray(older) && older.length) candles = older.concat(candles);
     }
     if (!candles.length) { toast('Replay : historique indisponible'); return; }
     resetTool();                                 // le pick se fait toujours au curseur
@@ -894,7 +909,7 @@ function rpPause() {
 }
 function exitReplay(reload = true) {
   rpPause(); replay = null; curtainX = null;
-  hoverBar = false;
+  hoverT = null;
   refreshTop();   // légende sans badge REPLAY + prix restauré, même si le load qui suit échoue
   $('replayBtn').classList.remove('on');
   $('replaybar').hidden = true; $('hint').hidden = true;
@@ -993,18 +1008,19 @@ function saveDrawings() {
    ancien schéma) ne doit jamais atteindre drawOne/hitTest — sinon exception dans le rAF */
 const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
+const tfOk = t => typeof t === 'string' && t !== '1m' && Object.hasOwn(TFSEC, t);   // TF de zone = 3m → 1M, aligné sur propTf
 function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
   if (d.width != null && !numOk(d.width)) return false;
   if (d.kind != null && !Object.hasOwn(RKINDS, d.kind)) return false;   // pas de clé héritée (__proto__, toString…)
-  if (d.tfk != null && !(typeof d.tfk === 'string' && Object.hasOwn(TFSEC, d.tfk))) return false;
+  if (d.tfk != null && !tfOk(d.tfk)) return false;
   switch (d.type) {
     case 'hline':   return numOk(d.price);
     case 'vline':   return numOk(d.t);
     case 'hray':    return numOk(d.t) && numOk(d.price);
-    case 'text':    return numOk(d.t) && numOk(d.price) && typeof d.text === 'string' && d.text.length <= 500;
-    case 'brush':   return Array.isArray(d.pts) && d.pts.length > 0 && d.pts.length <= 3000 && d.pts.every(ptOk);
+    case 'text':    return numOk(d.t) && numOk(d.price) && typeof d.text === 'string' && d.text.length <= TEXT_MAX;
+    case 'brush':   return Array.isArray(d.pts) && d.pts.length > 0 && d.pts.length <= PTS_MAX && d.pts.every(ptOk);
     case 'channel': return ptOk(d.a) && ptOk(d.b) && numOk(d.off);
     case 'long': case 'short':
       return ptOk(d.a) && !!d.b && numOk(d.b.t) && numOk(d.target) && numOk(d.stop);
@@ -1017,8 +1033,8 @@ function loadDrawings() {
     const arr = JSON.parse(localStorage.getItem('orion-draw-' + symbol));
     drawings = (Array.isArray(arr) ? arr : []).map(d => {
       if (d && typeof d === 'object') {   // héritage pré-bornes : tronquer plutôt que perdre silencieusement
-        if (typeof d.text === 'string' && d.text.length > 500) d.text = d.text.slice(0, 500);
-        if (Array.isArray(d.pts) && d.pts.length > 3000) d.pts = d.pts.slice(0, 3000);
+        if (typeof d.text === 'string' && d.text.length > TEXT_MAX) d.text = d.text.slice(0, TEXT_MAX);
+        if (Array.isArray(d.pts) && d.pts.length > PTS_MAX) d.pts = d.pts.slice(0, PTS_MAX);
       }
       return d;
     }).filter(drawingOk);
@@ -1134,10 +1150,10 @@ $('eyeBtn').onclick = () => {
   invalidate();
 };
 $('undoBtn').onclick = () => {
-  const last = drawings[drawings.length - 1];
-  if (!last) return;
-  if (futureHidden(last)) toast('Tracé masqué (au-delà de la lecture) annulé');   // feedback, mais on n'empêche pas
-  drawings.pop(); saveDrawings(); select(null);
+  let i = drawings.length - 1;
+  while (i >= 0 && futureHidden(drawings[i])) i--;   // en replay : n'annule que du VISIBLE (rien de détruit à l'aveugle)
+  if (i < 0) { if (drawings.length) toast('Rien de visible à annuler ici'); return; }
+  drawings.splice(i, 1); saveDrawings(); select(null);
   if (tool !== 'cursor' && tool !== 'eraser') showPropbar(true);   // l'outil reste armé → la barre reste
 };
 $('clearBtn').onclick = () => clearDrawings();
@@ -1182,8 +1198,8 @@ $('propDup').onclick = () => {
 $('propDel').onclick = () => { if (sel != null) deleteDrawing(sel); };
 
 function setProp(k, v) {
-  defaultStyle[k] = v;
-  if (k === 'color' && sel == null && tool === 'rect' && rectKind) rectColor = v;   // choix explicite > préréglage du type
+  if (k === 'color' && sel == null && tool === 'rect' && rectKind) rectColor = v;   // choix pour le rect typé, SANS polluer defaultStyle
+  else defaultStyle[k] = v;
   if (sel != null) { drawings[sel][k] = v; saveDrawings(); }
   syncPropbar();
 }
@@ -1194,12 +1210,13 @@ function syncPropbar() {
   try { $('propColor').value = st.color; } catch {}
   $('propWidth').value = String(st.width);
   $('propStyle').value = st.dash || 'solid';
-  const rectCtx = sel != null && drawings[sel] ? drawings[sel].type === 'rect' : tool === 'rect';
+  const r = rectSel();
+  const rectCtx = r || (sel == null && tool === 'rect');
   $('propKind').hidden = !rectCtx;
   $('propTf').hidden = !rectCtx;
   if (rectCtx) {
-    $('propKind').value = sel != null && drawings[sel] ? (drawings[sel].kind || '') : rectKind;
-    $('propTf').value = sel != null && drawings[sel] ? (drawings[sel].tfk || '') : rectTf;
+    $('propKind').value = r ? (r.kind || '') : rectKind;
+    $('propTf').value = r ? (r.tfk || '') : rectTf;
   }
 }
 TFS.slice(1).forEach(t => {   // 3m → 1M (le 1m n'est pas un TF de zone)
@@ -1207,19 +1224,20 @@ TFS.slice(1).forEach(t => {   // 3m → 1M (le 1m n'est pas un TF de zone)
   o.value = t; o.textContent = tfLabel(t);
   $('propTf').appendChild(o);
 });
+const rectSel = () => sel != null && drawings[sel] && drawings[sel].type === 'rect' ? drawings[sel] : null;
 $('propTf').addEventListener('change', e => {
-  const v = e.target.value;
-  if (sel != null && drawings[sel] && drawings[sel].type === 'rect') {
-    if (v) drawings[sel].tfk = v; else delete drawings[sel].tfk;
+  const v = e.target.value, r = rectSel();
+  if (r) {
+    if (v) r.tfk = v; else delete r.tfk;
     saveDrawings();
   } else rectTf = v;
   syncPropbar();
 });
 $('propKind').addEventListener('change', e => {
-  const v = e.target.value;
-  if (sel != null && drawings[sel] && drawings[sel].type === 'rect') {
-    if (v) { drawings[sel].kind = v; drawings[sel].color = RKINDS[v].color; }
-    else delete drawings[sel].kind;
+  const v = e.target.value, r = rectSel();
+  if (r) {
+    if (v) { r.kind = v; r.color = RKINDS[v].color; }
+    else delete r.kind;
     saveDrawings();
   } else {
     rectKind = v; rectColor = null;   // préréglage du type, sans polluer defaultStyle (les autres outils gardent leur couleur)
@@ -1246,7 +1264,7 @@ function openTxtIn(clientX, clientY, value = '') {
 function commitTxtIn() {   // valide le texte en cours (Entrée, blur, ou re-clic ailleurs)
   const t = $('txtIn');
   if (t.style.display === 'none') return;
-  const v = t.value.trim().slice(0, 500);   // même borne que drawingOk : jamais de tracé qui périra au rechargement
+  const v = t.value.trim().slice(0, TEXT_MAX);   // même borne que drawingOk : jamais de tracé qui périra au rechargement
   if (v) {
     if (editIdx != null) drawings[editIdx].text = v;
     else if (txtPos) drawings.push({ type: 'text', ...txtPos, ...defaultStyle, text: v });
@@ -1402,7 +1420,8 @@ function futureHidden(d) {
     if (d.pts) { mt = Infinity; for (const p of d.pts) if (p.t < mt) mt = p.t; }
     else if (d.a) mt = d.b && d.b.t != null ? Math.min(d.a.t, d.b.t) : d.a.t;
     else mt = d.t;
-    minTCache.set(d, mt = mt == null ? null : mt);
+    minTCache.set(d, mt ?? null);   // WeakMap.get renvoie undefined sur absence : on stocke null pour distinguer
+    mt = mt ?? null;
   }
   return mt != null && mt > head.time;
 }
@@ -1518,17 +1537,35 @@ let hoverX = null, hoverY = null, hoverQueued = false;
 document.addEventListener('mousemove', e => {
   if (drag) {
     const m = mpos(e);
-    const dx = m.x - drag.x0, dy = m.y - drag.y0;
+    let dx = m.x - drag.x0;
+    const dy = m.y - drag.y0;
     const d = drawings[drag.i], o = drag.orig;
+    if (replay) {
+      /* butée RIGIDE contre la tête de lecture : on plafonne le delta partagé, pas chaque
+         ancre — sinon un drag de corps écrase le tracé (les ancres s'empilent sur la tête) */
+      const h = curBar();
+      const mts = (() => {   // ancre max réellement déplacée par ce drag
+        if (drag.part === 'a' || drag.part === 'b') return o[drag.part] && o[drag.part].t != null ? o[drag.part].t : null;
+        if (drag.part === 'target' || drag.part === 'stop' || drag.part === 'c') return null;   // prix seul
+        if (o.pts) { let mx2 = -Infinity; for (const p of o.pts) if (p.t > mx2) mx2 = p.t; return mx2; }
+        let mm = null;
+        for (const v of [o.a && o.a.t, o.b && o.b.t, o.t]) if (v != null) mm = mm == null ? v : Math.max(mm, v);
+        return mm;
+      })();
+      if (h && mts != null) {
+        const lh = lOf(h.time), lm = lOf(mts);
+        if (lh != null && lm != null) dx = Math.min(dx, Math.max((lh - lm) * (barSp || 6), 0));
+      }
+    }
     const mvT = t => {
       /* delta appliqué en logique fractionnaire : coordinateToLogical arrondit à l'entier (ceil),
-         ce qui ferait sauter d'une bougie toute ancre inter-bougies (tracé venu d'un autre TF) */
+         ce qui ferait sauter d'une bougie toute ancre inter-bougies (tracé venu d'un autre TF) ;
+         borné : pas d'ancre expédiée à des milliers d'écrans des données */
       const l = lOf(t);
-      let nt = l != null ? tOf(l + dx / (barSp || 6)) : null;
-      if (replay && nt != null) {   // pas d'ancre déplacée au-delà de la tête de lecture
-        const h = curBar();
-        if (h && nt > h.time) nt = h.time;
-      }
+      if (l == null) return t;
+      const len = dataNow().length;
+      const nl = Math.max(-(len + 2000), Math.min(len + 2000, l + dx / (barSp || 6)));
+      const nt = tOf(nl);
       return nt != null ? nt : t;
     };
     const mvP = p => { const c = series.priceToCoordinate(p); const np = c != null ? series.coordinateToPrice(c + dy) : null; return np != null ? np : p; };
@@ -1839,18 +1876,26 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 })();
 
 /* --- bougies du passé : chargement auto en scrollant vers la gauche --- */
+let oldErrUntil = 0;   // pause après une erreur API (ban 429/418) : pas de tempête de requêtes au bord gauche
 ts().subscribeVisibleLogicalRangeChange(async r => {
   // contexte périmé (backoff après changement TF/symbole) : tout fetch mélangerait deux actifs
-  if (!r || r.from > 30 || replay || loading || (retryTimer && !ctxFresh()) || loadingOld || oldestDone || !candles.length) return;
+  if (!r || r.from > 30 || replay || ctxBusy() || loadingOld || oldestDone || Date.now() < oldErrUntil || !candles.length) return;
   loadingOld = true;
   try {
-    const older = await fetchOlder(1500);        // max Binance : 3× moins de reconstructions qu'à 500
-    if (replay || loading) return;               // supplanté pendant le fetch
+    let older;
+    try { older = await fetchOlder(1500); } catch { older = 'err'; }   // max Binance : 3× moins de reconstructions
+    if (replay) return;                          // supplanté pendant le fetch
+    if (older === 'err') { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
     if (older == null) return;                   // contexte périmé (seq/tête) → réponse jetée
     if (!older.length) { oldestDone = true; return; }
+    if (candles.length + older.length > MAX_BARS) {   // ne JAMAIS franchir le plafond : sinon le prochain
+      older = older.slice(older.length - Math.max(0, MAX_BARS - candles.length));   // tick live raserait la tête
+      oldestDone = true;
+      if (!older.length) return;
+    }
     candles = older.concat(candles);
     setAllDeferInd(candles);
-    if (older.length < 1500 || candles.length >= MAX_BARS) oldestDone = true; // borne mémoire du scroll-back
+    if (older.length < 1500) oldestDone = true;
   } catch {} finally { loadingOld = false; }
 });
 
