@@ -1630,7 +1630,9 @@ function drawOne(d, isSel) {
   ctx.setLineDash(DASHES[d.dash] || []);
   ctx.fillStyle = hexToRgba(col, .10);
   ctx.font = '10px Segoe UI';
-  if (isSel) { ctx.shadowColor = col; ctx.shadowBlur = 8; }
+  /* léger glow sur TOUS les outils de tracé (demande Meddy), renforcé à la sélection ;
+     coupé pendant les interactions continues (hudGlow) pour préserver le pan */
+  ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 8 : 3) : 0;
   if (d.type === 'hline') {
     const y = series.priceToCoordinate(d.price);
     if (y != null) {
@@ -1739,7 +1741,7 @@ function drawOne(d, isSel) {
         if (lbl && w > 34 && h > 16) {   // label centré, taille dynamique
           const fs = Math.max(9, Math.min(24, h * .24, w * .14));
           ctx.fillStyle = hexToRgba(col, .92);
-          ctx.font = `600 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;
+          ctx.font = `300 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;   // graisse FINE (demande Meddy)
           ctx.letterSpacing = (fs * .22).toFixed(1) + 'px';
           ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? fs * .45 : 0;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
