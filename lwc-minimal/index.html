@@ -1522,7 +1522,7 @@ function drawOne(d, isSel) {
       ctx.beginPath(); ctx.moveTo(xL, yE); ctx.lineTo(xL + w, yE); ctx.stroke();
       ctx.setLineDash([]);
       const rr = Math.abs(d.target - d.a.price) / Math.max(Math.abs(d.a.price - d.stop), 1e-9);
-      ctx.font = '10px Segoe UI';
+      ctx.font = '300 10px "Segoe UI"';   // graisse fine, uniquement pour les positions
       ctx.fillStyle = GRN;
       ctx.fillText(`Cible ${fmt(d.target)}  ${((d.target - d.a.price) / d.a.price * 100).toFixed(2)}%`,
         xL + 4, isL ? Math.min(yT, yE) + 11 : Math.max(yT, yE) - 4);
