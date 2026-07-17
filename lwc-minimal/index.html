@@ -428,21 +428,37 @@ const atrSeries = chart.addSeries(LWC.LineSeries, {
   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
 });
 atrSeries.priceScale().applyOptions({ scaleMargins: { top: .93, bottom: .01 } });
-let lastAtr = null;
-function computeInd() {
+let lastAtr = null, indTrs = [], indSum = 0;
+function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chemin par-bougie passe par updateInd
   const src = dataNow();
-  const atr = [], trs = [];
-  let trSum = 0;
+  const atr = [];
+  indTrs = []; indSum = 0;
   for (let i = 0; i < src.length; i++) {
     const tr = i === 0
       ? src[0].high - src[0].low
       : Math.max(src[i].high - src[i].low, Math.abs(src[i].high - src[i - 1].close), Math.abs(src[i].low - src[i - 1].close));
-    trs.push(tr); trSum += tr;
-    if (i >= IND_N) trSum -= trs[i - IND_N];
-    if (i >= IND_N - 1) atr.push({ time: src[i].time, value: trSum / IND_N });
+    indTrs.push(tr); indSum += tr;
+    if (i >= IND_N) indSum -= indTrs[i - IND_N];
+    if (i >= IND_N - 1) atr.push({ time: src[i].time, value: indSum / IND_N });
   }
   atrSeries.setData(atr);
   lastAtr = atr.length ? atr[atr.length - 1].value : null;
+}
+function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bougie (somme glissante persistée)
+  const tr = prev
+    ? Math.max(bar.high - bar.low, Math.abs(bar.high - prev.close), Math.abs(bar.low - prev.close))
+    : bar.high - bar.low;
+  if (isNew) {
+    indTrs.push(tr); indSum += tr;
+    if (indTrs.length - 1 >= IND_N) indSum -= indTrs[indTrs.length - 1 - IND_N];
+  } else {
+    indSum += tr - indTrs[indTrs.length - 1];
+    indTrs[indTrs.length - 1] = tr;
+  }
+  if (indTrs.length >= IND_N) {
+    lastAtr = indSum / IND_N;
+    atrSeries.update({ time: bar.time, value: lastAtr });
+  }
 }
 const volColor = (o, c) => c >= o ? hexToRgba(theme.up, .35) : hexToRgba(theme.downLine, .25);
 const ts = () => chart.timeScale();
@@ -491,19 +507,22 @@ function setAll(arr) {
 }
 function refreshTop() {
   const c = candles[candles.length - 1];
-  $('lastPrice').textContent = fmt(c.close);
+  if (!c) return;
+  lastPriceTxt = fmt(c.close);   // appliqué au DOM dans le rAF (chemin chaud : 1 écriture/trade sinon)
   legend(c);
 }
 function applyBar(bar) {
   const last = candles[candles.length - 1];
+  let isNew = false;
   if (bar.time > last.time) {
     if (bar.time > barEnd(last.time)) { fillGap(); return; }   // trou (veille, coupure) → rattrapage REST
-    candles.push(bar);
+    candles.push(bar); isNew = true;
     if (candles.length > 21000) { candles = candles.slice(-20000); setAll(candles); return; }
   } else if (bar.time === last.time) candles[candles.length - 1] = bar;
   else return;
   series.update(bar); volSeries.update(volOf(bar));
-  computeInd(); refreshTop(); invalidate();
+  updateInd(isNew ? last : candles[candles.length - 2], bar, isNew);
+  refreshTop(); invalidate();
 }
 
 /* rattrape les bougies manquantes entre la dernière connue et maintenant */
@@ -647,13 +666,17 @@ function startWs(attempt = 0) {
   };
 }
 
-/* ---------- legend ---------- */
+/* ---------- legend ----------
+   construite à chaud (string), mais le innerHTML n'est écrit que dans le rAF
+   et seulement si le contenu a changé : les flux aggTrade (jusqu'à 300/s) et
+   le crosshair (60-125 Hz) ne re-parsent plus le DOM en continu */
+let legendHTML = '', legendShown = null, lastPriceTxt = '—', lastPriceShown = null;
 function legend(bar, vol, atrV) {
   if (!bar) return;
   const pct = (bar.close - bar.open) / bar.open * 100;
   const cls = pct >= 0 ? 'up' : 'dn';
   const a = atrV !== undefined ? atrV : lastAtr;
-  $('legend').innerHTML =
+  legendHTML =
     `<b>${esc(symbol)}</b> · Perp · ${tfLabel(tf)}${replay ? ' · <span style="color:#f0d478">REPLAY</span>' : ''}<br>` +
     `O <span class="${cls}">${fmt(bar.open)}</span>  H <span class="${cls}">${fmt(bar.high)}</span>  ` +
     `L <span class="${cls}">${fmt(bar.low)}</span>  C <span class="${cls}">${fmt(bar.close)}</span>  ` +
@@ -762,10 +785,12 @@ function rpStep() {
   if (!replay || replay.picking) return;
   if (replay.i >= replay.data.length - 1) { rpPause(); toast('Fin du replay — bord droit atteint'); return; }
   replay.i++;
-  series.update(replay.data[replay.i]);
-  volSeries.update(volOf(replay.data[replay.i]));
-  computeInd(); invalidate();
-  legend(replay.data[replay.i]);
+  const b = replay.data[replay.i];
+  series.update(b);
+  volSeries.update(volOf(b));
+  updateInd(replay.data[replay.i - 1], b, true);
+  invalidate();
+  legend(b);
 }
 function rpPlay() {
   if (!replay || replay.picking || replay.playing) return;
@@ -1513,6 +1538,8 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 (function render() {
   if (!cvH) sizeCv();   // auto-guérison si l'observer n'a jamais tiré
   updateCountdown();
+  if (legendHTML !== legendShown) { $('legend').innerHTML = legendShown = legendHTML; }
+  if (lastPriceTxt !== lastPriceShown) { $('lastPrice').textContent = lastPriceShown = lastPriceTxt; }
   if (dirty || drag || temp || measure || (replay && replay.picking)) {
     dirty = false;
     ctx.clearRect(0, 0, cvW, cvH);
