@@ -387,6 +387,7 @@ const SYMBOLS = [
   ['WLDUSDT','Worldcoin'], ['TIAUSDT','Celestia'], ['1000PEPEUSDT','Pepe ×1000'], ['1000SHIBUSDT','Shiba ×1000'],
 ];
 
+const MAX_BARS = 50000;   // plafond mémoire unique : applyBar, fillGap et scroll-back historique
 let symbol = 'BTCUSDT', tf = '1m', prec = 2;
 let candles = [];
 let ws = null, loadSeq = 0;
@@ -517,7 +518,7 @@ function applyBar(bar) {
   if (bar.time > last.time) {
     if (bar.time > barEnd(last.time)) { fillGap(); return; }   // trou (veille, coupure) → rattrapage REST
     candles.push(bar); isNew = true;
-    if (candles.length > 21000) { candles = candles.slice(-20000); setAll(candles); return; }
+    if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); return; }
   } else if (bar.time === last.time) candles[candles.length - 1] = bar;
   else return;
   series.update(bar); volSeries.update(volOf(bar));
@@ -547,7 +548,9 @@ async function fillGap() {
           series.update(b); volSeries.update(volOf(b));
         }
       });
-      computeInd(); refreshTop(); invalidate();
+      if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); }
+      else computeInd();
+      refreshTop(); invalidate();
       if (k.length < 1000) break;
     }
   } catch {} finally { gapFilling = false; }
@@ -596,18 +599,21 @@ function startPoll(seq) {
   const syncClock = () => fetch('https://fapi.binance.com/fapi/v1/time').then(r => r.json())
     .then(j => { if (j.serverTime) clockOff = j.serverTime - Date.now(); }).catch(() => {});
   syncClock();
-  let backoff = 0, ticks = 0;
+  let backoff = 0, ticks = 0, inFlight = false, fails = 0;
   pollTimer = setInterval(async () => {
-    if (seq !== loadSeq) return;
+    if (seq !== loadSeq || inFlight) return;             // sérialise : pas de réponses hors ordre
     if (replay || !candles.length) return;
     if (backoff > 0) { backoff--; return; }              // recul après erreur (429, réseau…)
     if (++ticks % 30 === 0) syncClock();                 // resynchronise l'horloge toutes les ~60 s
+    inFlight = true;
     try {
       const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=2`)).json();
       if (seq !== loadSeq || !candles.length) return;
       if (!Array.isArray(k)) { backoff = 15; return; }   // {code,msg} → pause 30 s
+      fails = 0; $('dot').classList.add('live');
       k.forEach(x => applyBar(mapK(x)));
-    } catch { backoff = 5; }
+    } catch { backoff = 5; if (++fails >= 3 && seq === loadSeq) $('dot').classList.remove('live'); }
+    finally { inFlight = false; }
   }, 2000);
 }
 
@@ -643,6 +649,7 @@ function startWs(attempt = 0) {
     }, 2000);
   };
   ws.onmessage = e => {
+    if (seq !== loadSeq) return;   // message en file délivré après stopWs (TF/symbole déjà commutés)
     try {
       gotMsg = true; lastMsgAt = Date.now();
       const { stream, data: d } = JSON.parse(e.data);
@@ -712,18 +719,22 @@ TFS.forEach(t => {
 });
 
 /* ---------- symboles ---------- */
+let symSeq = 0;
 async function setSymbol(v) {
   if (!v || v === symbol) { $('symPanel').hidden = true; return; }
   $('symPanel').hidden = true;
+  if (!/^[A-Z0-9_]{2,20}$/.test(v)) { toast(`Symbole invalide : ${v}`); return; }   // défense en profondeur (URLs)
+  const req = ++symSeq;                          // le dernier clic gagne, pas la dernière réponse
   try {                                          // valider AVANT de toucher l'état
     const k = await (await fetch(`${REST}?symbol=${encodeURIComponent(v)}&interval=${tf}&limit=1`)).json();
+    if (req !== symSeq) return;
     if (!Array.isArray(k) || !k.length) { toast(`Symbole invalide : ${v}`); return; }
-  } catch { toast('Réseau : symbole non vérifié, réessaie'); return; }
+  } catch { if (req === symSeq) toast('Réseau : symbole non vérifié, réessaie'); return; }
   if (replay) exitReplay(false);
   symbol = v;
   $('symBtn').textContent = v + ' ▾';
   loadDrawings();                                // tracés propres à chaque symbole (localStorage)
-  load();
+  load(true);                                    // même zoom : on compare des paires au même cadrage
 }
 function fillSymList(filter = '') {
   const f = filter.toUpperCase();
@@ -811,7 +822,7 @@ function exitReplay(reload = true) {
   $('replayBtn').classList.remove('on');
   $('replaybar').hidden = true; $('hint').hidden = true;
   if (!$('propbar').hidden) $('propbar').style.top = '12px';   // la propbar suit la replaybar
-  if (reload) load();
+  if (reload) load(true);   // même zoom : on revient là où on étudiait
 }
 $('replayBtn').onclick = () => replay ? exitReplay() : enterReplay();
 $('rpExit').onclick = () => exitReplay();
@@ -1572,15 +1583,17 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
   loadingOld = true;
   const seq = loadSeq;
   try {
-    const resp = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500&endTime=${candles[0].time * 1000 - 1}`);
+    const endT = candles[0].time * 1000 - 1;
+    const resp = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=500&endTime=${endT}`);
     const k = await resp.json();
     if (seq !== loadSeq || replay || loading || !Array.isArray(k)) return;   // supplanté pendant le fetch
+    if (!candles.length || candles[0].time * 1000 - 1 !== endT) return;      // la tête a bougé (cap) → trou sinon
     const first = candles[0].time;
     const older = k.filter(x => x[0] / 1000 < first);
     if (!older.length) { oldestDone = true; return; }
     candles = older.map(mapK).concat(candles);
     setAll(candles);
-    if (k.length < 500) oldestDone = true;
+    if (k.length < 500 || candles.length >= MAX_BARS) oldestDone = true;     // borne mémoire du scroll-back
   } catch {} finally { loadingOld = false; }
 });
 
