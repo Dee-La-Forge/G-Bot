@@ -254,6 +254,9 @@
     <button class="tool" data-tool="hray" data-tip="Rayon horizontal">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="5.5" cy="12" r="2"/><path d="M8 12h13"/></svg>
     </button>
+    <button class="tool" data-tool="alert" data-tip="Alerte de prix (son au franchissement)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>
+    </button>
     <button class="tool" data-tool="vline" data-tip="Ligne verticale">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 3v6.5M12 14.5V21"/><circle cx="12" cy="12" r="2"/></svg>
     </button>
@@ -383,6 +386,49 @@ if (!window.LightweightCharts) {
 const LWC = LightweightCharts;
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const GOLD = '#d9b64d', GOLD_B = '#f0d478', GOLD_D = '#8a6d2f';
+const ALERT_COL = '#e04da8';   // couleur des alertes de prix
+
+/* ---- son des alertes : Web Audio synthétisé (aucun fichier, compatible CSP) ---- */
+let audioCtx = null;
+function unlockAudio() {   // à appeler sur un geste utilisateur (l'AudioContext exige une interaction)
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch {}
+}
+function beep() {   // deux notes brèves, façon carillon
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  [880, 1174].forEach((f, i) => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine'; o.frequency.value = f;
+    o.connect(g); g.connect(audioCtx.destination);
+    const s = t0 + i * 0.16;
+    g.gain.setValueAtTime(0, s);
+    g.gain.linearRampToValueAtTime(0.25, s + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, s + 0.15);
+    o.start(s); o.stop(s + 0.16);
+  });
+}
+let alertPrev = null, alertFlashUntil = 0;   // dernier prix vu (détection de croisement) ; fenêtre de flash
+function checkAlerts(price) {
+  if (alertPrev != null && price !== alertPrev) {
+    const now = Date.now();
+    for (const d of drawings) {
+      if (d.type !== 'alert') continue;
+      const lvl = d.price;
+      const crossed = (alertPrev < lvl && price >= lvl) || (alertPrev > lvl && price <= lvl);
+      if (crossed && now - (d.firedAt || 0) > 3000) {   // anti-spam : 3 s entre deux déclenchements
+        d.firedAt = now;
+        alertFlashUntil = now + 1500;   // le rAF redessine pendant tout le flash
+        beep();
+        toast(`⚠ Alerte ${fmt(lvl)} franchie`);
+        invalidate();
+      }
+    }
+  }
+  alertPrev = price;
+}
 const REST = 'https://fapi.binance.com/fapi/v1/klines';
 const WSS  = 'wss://fstream.binance.com/stream';
 const SYM_RE = /^[A-Z0-9_]{2,20}$/;   // format symbole — source unique (setSymbol + restauration)
@@ -791,6 +837,7 @@ function refreshTop() {
   const c = candles[candles.length - 1];
   if (!c) return;
   lastPriceTxt = fmt(c.close);   // appliqué au DOM dans le rAF (chemin chaud : 1 écriture/trade sinon)
+  if (!replay) checkAlerts(c.close);   // franchissement d'alerte (jamais en replay)
   if (hoverT == null) legend(c);
   else if (hoverT === c.time) legend(c, c.volume);   // survol de la bougie LIVE : elle vit, champ V compris
 }
@@ -1400,6 +1447,7 @@ function drawingOk(d) {
   if (d.tfk != null && !tfOk(d.tfk)) return false;
   switch (d.type) {
     case 'hline':   return numOk(d.price);
+    case 'alert':   return numOk(d.price);
     case 'vline':   return numOk(d.t);
     case 'hray':    return numOk(d.t) && numOk(d.price);
     case 'text':    return numOk(d.t) && numOk(d.price) && typeof d.text === 'string' && d.text.length <= TEXT_MAX;
@@ -1527,6 +1575,7 @@ function deleteDrawing(i) {
   else if (sel != null && sel > i) sel--;
   if (tool === 'cursor') wrap.style.cursor = '';   // pas de pointer orphelin après Suppr
 }
+addEventListener('pointerdown', unlockAudio);   // débloque l'audio au 1er geste (alertes chargées d'une session précédente)
 $('magnetBtn').onclick = () => { magnet = !magnet; $('magnetBtn').classList.toggle('on', magnet); $('magnetBtn').setAttribute('aria-pressed', String(magnet)); };
 $('eyeBtn').onclick = () => {
   showDraw = !showDraw;
@@ -1706,6 +1755,7 @@ wrap.addEventListener('mousedown', e => {
   measure = null;
   const st = { ...defaultStyle };
   if (tool === 'hline') { commit({ type: 'hline', price: p.price, ...st }); return; }
+  if (tool === 'alert') { unlockAudio(); commit({ type: 'alert', price: p.price, ...st, color: ALERT_COL }); return; }
   if (p.t == null) return;
   if (tool === 'vline') { commit({ type: 'vline', t: p.t, ...st }); return; }
   if (tool === 'hray')  { commit({ type: 'hray', t: p.t, price: p.price, ...st }); return; }
@@ -1799,7 +1849,7 @@ function handles(d) {
     return [{ x: xA, y: yE, part: 'a' }, { x: xB, y: yE, part: 'b' },
             { x: xm, y: yT, part: 'target' }, { x: xm, y: yS, part: 'stop' }];
   }
-  if (d.type === 'hline') { const y = series.priceToCoordinate(d.price); return [{ x: paneW() / 2, y, part: 'body' }]; }
+  if (d.type === 'hline' || d.type === 'alert') { const y = series.priceToCoordinate(d.price); return [{ x: paneW() / 2, y, part: 'body' }]; }
   if (d.type === 'vline') { return [{ x: xOf(d.t), y: paneH() / 2, part: 'body' }]; }
   if (d.type === 'hray' || d.type === 'text') { const [x, y] = px(d); return [{ x, y, part: 'body' }]; }
   return [];
@@ -1833,7 +1883,7 @@ function futureHidden(d) {
   if (!replay) return false;
   const head = curBar();
   if (!head) return false;
-  if (d.type === 'hline') return false;   // pas d'ancre temporelle
+  if (d.type === 'hline' || d.type === 'alert') return false;   // pas d'ancre temporelle
   let mt = minTCache.get(d);
   if (mt === undefined) minTCache.set(d, mt = anchorTs(d, Math.min) ?? null);   // undefined = absent, null = sans ancre
   // tolérance quart de bougie : l'arrondi flottant du clamp de drag peut poser une ancre 1 ulp au-delà de la tête
@@ -1851,7 +1901,7 @@ function hitTest(mx, my) {
     const d = drawings[i];
     if (futureHidden(d)) continue;
     let hit = false;
-    if (d.type === 'hline') { const y = series.priceToCoordinate(d.price); hit = y != null && Math.abs(my - y) < TH; }
+    if (d.type === 'hline' || d.type === 'alert') { const y = series.priceToCoordinate(d.price); hit = y != null && Math.abs(my - y) < TH; }
     else if (d.type === 'vline') { const x = xOf(d.t); hit = x != null && Math.abs(mx - x) < TH; }
     else if (d.type === 'hray') { const [x, y] = px(d); hit = x != null && y != null && Math.abs(my - y) < TH && mx > x - TH; }
     else if (d.type === 'text') {
@@ -2002,7 +2052,7 @@ document.addEventListener('mousemove', e => {
     } else if (drag.part === 'a' || drag.part === 'b') {
       d[drag.part] = snap({ t: mvT(o[drag.part].t), price: mvP(o[drag.part].price) });
     } else {
-      if (d.type === 'hline') d.price = mvP(o.price);
+      if (d.type === 'hline' || d.type === 'alert') { d.price = mvP(o.price); d.firedAt = 0; }   // déplacée = ré-armée
       else if (d.type === 'vline') d.t = mvT(o.t);
       else if (d.type === 'hray' || d.type === 'text') { d.t = mvT(o.t); d.price = mvP(o.price); }
       else if (d.type === 'brush') d.pts = o.pts.map(p => ({ t: mvT(p.t), price: mvP(p.price) }));
@@ -2048,6 +2098,24 @@ function drawOne(d, isSel) {
     if (y != null) {
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(paneW(), y); ctx.stroke();
       ctx.setLineDash([]); ctx.shadowBlur = 0; ctx.fillStyle = col; ctx.fillText(fmt(d.price), 6, y - 4);
+    }
+  } else if (d.type === 'alert') {
+    const y = series.priceToCoordinate(d.price);
+    if (y != null) {
+      const flash = d.firedAt && Date.now() - d.firedAt < 1500;   // pulse bref au déclenchement
+      ctx.strokeStyle = col; ctx.setLineDash([6, 5]);
+      ctx.lineWidth = (d.width || 1.5) + (flash ? 1.5 : 0);
+      if (flash) { ctx.shadowColor = col; ctx.shadowBlur = 14; }
+      ctx.beginPath(); ctx.moveTo(28, y); ctx.lineTo(paneW(), y); ctx.stroke();
+      ctx.setLineDash([]); ctx.shadowBlur = 0;
+      // cloche à gauche + prix
+      ctx.fillStyle = col; ctx.strokeStyle = col; ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(8, y + 5); ctx.lineTo(20, y + 5);
+      ctx.moveTo(9.5, y + 5); ctx.quadraticCurveTo(9.5, y - 4, 14, y - 4);
+      ctx.quadraticCurveTo(18.5, y - 4, 18.5, y + 5); ctx.stroke();
+      ctx.beginPath(); ctx.arc(14, y + 7, 1.3, 0, 2 * Math.PI); ctx.fill();
+      ctx.font = '600 10px Segoe UI'; ctx.fillText(fmt(d.price), 24, y - 5);
     }
   } else if (d.type === 'vline') {
     const x = xOf(d.t);
@@ -2264,7 +2332,7 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
   /* un geste EN ATTENTE (canal phase 2, picking) ne redessine que si le pointeur vit :
      souris immobile = 0 redraw (et le glow ne se coupe pas à vide) */
   const pointerLive = Date.now() - lastPointer < 300;
-  const active = dirty || drag || ((temp || (replay && replay.picking)) && pointerLive);
+  const active = dirty || drag || ((temp || (replay && replay.picking)) && pointerLive) || Date.now() < alertFlashUntil;
   const polish = !active && redrawStreak > 2;
   if (!active) redrawStreak = 0;
   if (active || polish) {
