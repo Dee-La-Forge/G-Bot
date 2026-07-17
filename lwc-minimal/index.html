@@ -898,7 +898,7 @@ const PALETTE = ['#f0d478','#d9b64d','#f2984d','#e0564d','#e04da8','#9b59e0','#4
 const DASHES = { solid: [], dash: [8,5], dot: [2,3] };
 let defaultStyle = { color: '#d9b64d', width: 1.5, dash: 'solid' };
 /* types sémantiques du rectangle (doctrine) : label + couleur préréglée */
-const RKINDS = { ob: { label: 'OB', color: '#f0d478' }, acc: { label: 'ACCÉLÉRATION', color: '#f2984d' }, sd: { label: 'S/D', color: '#4d8fe0' } };
+const RKINDS = { ob: { label: 'OB', color: '#f0d478' }, acc: { label: 'ACC', color: '#f2984d' }, sd: { label: 'S/D', color: '#4d8fe0' } };
 let rectKind = '';   // type appliqué aux prochains rectangles tracés
 let drawings = [], temp = null, measure = null;
 let sel = null, drag = null, editIdx = null;
@@ -1549,11 +1549,36 @@ function drawOne(d, isSel) {
         ctx.lineTo(x2 - 11 * Math.cos(ang + .4), y2 - 11 * Math.sin(ang + .4));
         ctx.fill();
       } else if (d.type === 'rect') {
-        boxFS(x1, y1, x2, y2);
+        /* style HUD validé par Meddy — les AUTRES outils restent au style d'origine */
+        const xa = Math.min(x1, x2), xb = Math.max(x1, x2), ya = Math.min(y1, y2), yb = Math.max(y1, y2);
+        const w = xb - xa, h = yb - ya;
+        ctx.fillStyle = hexToRgba(col, .06);
+        ctx.fillRect(xa, ya, w, h);
+        ctx.setLineDash([]);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = hexToRgba(col, .35);
+        ctx.strokeRect(xa + .5, ya + .5, w - 1, h - 1);
+        const cr = Math.min(12, w / 3, h / 3);
+        ctx.strokeStyle = col; ctx.lineWidth = d.width || 1.5;
+        ctx.shadowColor = col; ctx.shadowBlur = isSel ? 10 : 6;
+        ctx.beginPath();
+        ctx.moveTo(xa, ya + cr); ctx.lineTo(xa, ya); ctx.lineTo(xa + cr, ya);
+        ctx.moveTo(xb - cr, ya); ctx.lineTo(xb, ya); ctx.lineTo(xb, ya + cr);
+        ctx.moveTo(xb, yb - cr); ctx.lineTo(xb, yb); ctx.lineTo(xb - cr, yb);
+        ctx.moveTo(xa + cr, yb); ctx.lineTo(xa, yb); ctx.lineTo(xa, yb - cr);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
         const k = RKINDS[d.kind];
-        if (k) {
-          ctx.setLineDash([]); ctx.fillStyle = col; ctx.font = 'bold 10px Segoe UI';
-          ctx.fillText(k.label, Math.min(x1, x2) + 5, Math.min(y1, y2) + 13);
+        if (k && w > 34 && h > 16) {   // label centré, taille dynamique
+          const fs = Math.max(9, Math.min(24, h * .24, w * .14));
+          ctx.fillStyle = hexToRgba(col, .92);
+          ctx.font = `600 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;
+          ctx.letterSpacing = (fs * .22).toFixed(1) + 'px';
+          ctx.shadowColor = col; ctx.shadowBlur = fs * .45;
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(k.label, xa + w / 2, ya + h / 2);
+          ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+          ctx.shadowBlur = 0; ctx.letterSpacing = '0px';
         }
       } else if (d.type === 'ellipse') {
         ctx.beginPath();
