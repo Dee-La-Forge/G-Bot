@@ -465,6 +465,47 @@ function cacheBars() {   // photographie le contexte courant avant de le quitter
   // SNAPSHOT du tableau (slice) : aucun mutateur asynchrone tardif ne peut toucher l'entrée cachée
   barCache.set(dataCtx, { candles: candles.slice(), oldestDone, firstTradeId, lastTradeMs, lastAggId });
   if (barCache.size > 6) barCache.delete(barCache.keys().next().value);
+  persistBars();   // + copie sur DISQUE (survit au rechargement)
+}
+
+/* ---- persistance des bougies sur disque : rechargement = affichage instantané puis rattrapage ---- */
+const BARS_CAP = 2000, BARS_CTX_MAX = 4, BARS_SCHEMA = 1;
+const barsKey = (s, t) => 'orion-bars-' + s + '|' + t;
+function persistBars() {
+  if (!candles.length || !ctxFresh()) return;
+  // secondes tronquées : firstTradeId ne correspondrait plus à candles[0] → on ne persiste que si tout tient
+  if (isSecTf() && candles.length > BARS_CAP) return;
+  try {
+    const key = barsKey(symbol, tf);
+    const atStart = oldestDone && candles.length <= BARS_CAP;   // a-t-on gardé le tout début ?
+    localStorage.setItem(key, JSON.stringify({
+      v: BARS_SCHEMA, t: Date.now(), atStart,
+      fi: firstTradeId, lm: lastTradeMs, la: lastAggId,
+      b: candles.slice(-BARS_CAP),
+    }));
+    let idx = [];
+    try { idx = JSON.parse(localStorage.getItem('orion-bars-idx')) || []; } catch {}
+    idx = idx.filter(k => k !== key); idx.push(key);
+    while (idx.length > BARS_CTX_MAX) { try { localStorage.removeItem(idx.shift()); } catch {} }
+    lsSet('orion-bars-idx', JSON.stringify(idx));
+  } catch {}   // quota dépassé : tant pis, la session reste fonctionnelle
+}
+function loadPersisted() {   // renvoie {b, atStart, fi, lm, la} sain et pas trop périmé, sinon null
+  try {
+    const raw = localStorage.getItem(barsKey(symbol, tf));
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || o.v !== BARS_SCHEMA || !Array.isArray(o.b) || !o.b.length) return null;
+    // trop vieux = trop de trou à combler : rechargement frais (secondes très court, klines borné à fillGap)
+    const maxAge = isSecTf() ? 90000 : 18000 * TFSEC[tfDef().src] * 1000;
+    if (typeof o.t !== 'number' || Date.now() - o.t > maxAge) return null;
+    let prev = -Infinity;   // validation profonde : OHLCV numérique, temps STRICTEMENT croissant
+    for (const c of o.b) {
+      if (!c || !numOk(c.time) || c.time <= prev || !numOk(c.open) || !numOk(c.high) || !numOk(c.low) || !numOk(c.close) || !numOk(c.volume)) return null;
+      prev = c.time;
+    }
+    return o;
+  } catch { return null; }
 }
 let dataCtx = '';   // contexte des candles chargées ; ≠ symbol|tf courant pendant un backoff = données périmées
 const ctxFresh = () => dataCtx === symbol + '|' + tf;
@@ -744,6 +785,7 @@ addEventListener('pagehide', () => {   // flush des écritures débouncées : F5
   clearTimeout(saveTimer); clearTimeout(themeTimer);
   try { localStorage.setItem('orion-draw-' + symbol, JSON.stringify(drawings)); } catch {}
   lsSet('orion-theme', JSON.stringify(theme));
+  if (!replay) persistBars();   // bougies du contexte courant sur disque → rechargement instantané
 });
 function refreshTop() {
   const c = candles[candles.length - 1];
@@ -862,11 +904,17 @@ async function load(keepZoom = false, attempt = 0) {
   try {
     let k, fromCache = false;
     const cached = barCache.get(symbol + '|' + tf);
+    const disk = cached ? null : loadPersisted();   // disque : uniquement si pas en mémoire vive
     if (cached && cached.candles.length) {   // TF déjà visité : zéro réseau, rattrapage du trou après affichage
       barCache.delete(symbol + '|' + tf);
       k = cached.candles;
       oldestDone = cached.oldestDone;
       firstTradeId = cached.firstTradeId; lastTradeMs = cached.lastTradeMs; lastAggId = cached.lastAggId || 0;
+      fromCache = true;
+    } else if (disk) {   // RECHARGEMENT : bougies du disque affichées tout de suite, trou comblé ensuite
+      k = disk.b;
+      oldestDone = !!disk.atStart;
+      firstTradeId = disk.fi; lastTradeMs = disk.lm || 0; lastAggId = disk.la || 0;
       fromCache = true;
     } else if (isSecTf()) {   // secondes : UNE seule page pour afficher VITE ; l'historique s'approfondit ensuite en arrière-plan
       const tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
