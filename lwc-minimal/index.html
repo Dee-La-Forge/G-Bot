@@ -1630,9 +1630,9 @@ function drawOne(d, isSel) {
   ctx.setLineDash(DASHES[d.dash] || []);
   ctx.fillStyle = hexToRgba(col, .10);
   ctx.font = '10px Segoe UI';
-  /* léger glow sur TOUS les outils de tracé (demande Meddy), renforcé à la sélection ;
+  /* glow futuriste sur TOUS les outils de tracé (demande Meddy), renforcé à la sélection ;
      coupé pendant les interactions continues (hudGlow) pour préserver le pan */
-  ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 8 : 3) : 0;
+  ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 12 : 6) : 0;
   if (d.type === 'hline') {
     const y = series.priceToCoordinate(d.price);
     if (y != null) {
@@ -1728,7 +1728,7 @@ function drawOne(d, isSel) {
         ctx.strokeRect(xa + .5, ya + .5, w - 1, h - 1);
         const cr = Math.min(12, w / 3, h / 3);
         ctx.strokeStyle = col; ctx.lineWidth = d.width || 1.5;
-        ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 10 : 6) : 0;
+        ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? (isSel ? 14 : 10) : 0;
         ctx.beginPath();
         ctx.moveTo(xa, ya + cr); ctx.lineTo(xa, ya); ctx.lineTo(xa + cr, ya);
         ctx.moveTo(xb - cr, ya); ctx.lineTo(xb, ya); ctx.lineTo(xb, ya + cr);
@@ -1738,12 +1738,13 @@ function drawOne(d, isSel) {
         ctx.shadowBlur = 0;
         const k = RKINDS[d.kind];
         const lbl = (k ? k.label : '') + (d.tfk ? (k ? ' · ' : '') + zLabel(d.tfk) : '');
-        if (lbl && w > 34 && h > 16) {   // label centré, taille dynamique
-          const fs = Math.max(9, Math.min(24, h * .24, w * .14));
+        if (lbl && w > 8 && h > 8) {   // label centré : rétrécit jusqu'à 7 px mais NE DISPARAÎT PAS (demande Meddy)
+          const fs = Math.max(7, Math.min(24, h * .24, w * .14));
           ctx.fillStyle = hexToRgba(col, .92);
-          ctx.font = `300 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;   // graisse FINE (demande Meddy)
+          ctx.font = `300 ${fs.toFixed(1)}px 'Bahnschrift Light', Bahnschrift, 'Segoe UI Light', 'Segoe UI', sans-serif`;
           ctx.letterSpacing = (fs * .22).toFixed(1) + 'px';
-          ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? fs * .45 : 0;
+          ctx.shadowColor = col;
+          ctx.shadowBlur = hudGlow ? Math.max(2, Math.min(8, fs * .5)) : 0;   // blur réduit en tout petit : lisible
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           ctx.fillText(lbl, xa + w / 2, ya + h / 2);
           ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
