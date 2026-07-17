@@ -457,6 +457,8 @@ const atrSeries = chart.addSeries(LWC.LineSeries, {
 atrSeries.priceScale().applyOptions({ scaleMargins: { top: .93, bottom: .01 } });
 let lastAtr = null, indTrs = [], indSum = 0, indStale = false, indTimer = null, indSince = 0;
 const IND_MAX_STALE = 1000;   // fenêtre max sans recalcul ATR (scroll continu / onglet throttlé) — source unique
+const indOverdue = () => Date.now() - indSince > IND_MAX_STALE;
+const indSoon = () => { clearTimeout(indTimer); indTimer = setTimeout(computeInd, 0); };   // hors du chemin chaud (burst WS, geste)
 function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chemin par-bougie passe par updateInd
   clearTimeout(indTimer); indTimer = null;   // le nettoyeur annule le déclencheur : pas de recompute orphelin
   indStale = false;
@@ -476,7 +478,7 @@ function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chem
 }
 function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bougie (somme glissante persistée)
   if (indStale) {   // fenêtre désalignée après un prepend différé
-    if (Date.now() - indSince > IND_MAX_STALE) computeInd();   // onglet throttlé : le timer peut ne jamais venir
+    if (indOverdue() && !document.hidden) indSoon();   // onglet throttlé : secours, mais pas DANS le tick
     return;
   }
   const tr = prev
@@ -494,7 +496,7 @@ function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bo
     atrSeries.update({ time: bar.time, value: lastAtr });
   }
 }
-let volUp = 'rgba(217,182,77,.35)', volDn = 'rgba(138,109,47,.25)';   // recalculées par applyTheme
+let volUp, volDn;   // posées par applyTheme (qui tourne au boot AVANT toute donnée) — pas de littéraux fantômes
 const volColor = (o, c) => c >= o ? volUp : volDn;   // pas de hexToRgba par bougie (50k allocations/tranche)
 const ts = () => chart.timeScale();
 
@@ -549,11 +551,11 @@ function setAllDeferInd(arr) {
   postSeries(arr);
   if (!indStale) indSince = Date.now();
   indStale = true;
-  clearTimeout(indTimer);
-  if (Date.now() - indSince > IND_MAX_STALE) computeInd();
-  else indTimer = setTimeout(computeInd, 400);
+  if (indOverdue()) indSoon();   // scroll continu : borne la fenêtre, hors du callback de geste
+  else { clearTimeout(indTimer); indTimer = setTimeout(computeInd, 400); }
   invalidate();
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && indStale) computeInd(); });
 function refreshTop() {
   const c = candles[candles.length - 1];
   if (!c) return;
@@ -576,14 +578,16 @@ function applyBar(bar) {
 }
 
 /* bougies plus anciennes que la tête de série — LA source unique du prepend (replay + scroll-back).
-   'err' = erreur API ({code,msg} : 429/418/-1121) à distinguer du contexte périmé (null :
-   seq bumpé, contexte changé, tête déplacée par un cap-slice) */
-async function fetchOlder(limit, ms = 10000) {
+   FETCH_ERR = erreur API/réseau (retentable) à distinguer du contexte périmé (null : seq bumpé,
+   contexte changé, tête déplacée par un cap-slice). Symbol : un 'err' string serait truthy avec
+   .length — un futur appelant naïf le concaténerait dans candles. */
+const FETCH_ERR = Symbol('fetch-err');
+async function fetchOlder(limit, ms) {
   const seq = loadSeq, endT = candles[0].time * 1000 - 1;
   let k;
   try { k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=${limit}&endTime=${endT}`, ms); }
-  catch { return 'err'; }   // réseau/timeout : même canal que l'erreur API — les appelants n'ont plus de try/catch
-  if (!Array.isArray(k)) return 'err';
+  catch { return FETCH_ERR; }
+  if (!Array.isArray(k)) return FETCH_ERR;
   if (seq !== loadSeq || !ctxFresh() || !candles.length || candles[0].time * 1000 - 1 !== endT) return null;
   const first = candles[0].time;
   return k.map(mapK).filter(b => b.time < first);
@@ -628,13 +632,15 @@ function snapToLive() {
   ts().setVisibleLogicalRange({ from: n - 1 + 6 - bars, to: n - 1 + 6 });
 }
 let loading = false, retryTimer = null;
+let keepRange = null;   // fenêtre temporelle à préserver à travers un changement de TF (posée par le clic TF)
 async function load(keepZoom = false, attempt = 0) {
   const seq = ++loadSeq;
   loading = true;
   clearTimeout(retryTimer); retryTimer = null;
   stopWs();
   oldestDone = false;
-  hoverT = null;   // nouveau contexte : la légende live reprend la main
+  oldErrUntil = 0;   // la pause d'erreur du scroll-back ne survit pas à un changement de contexte
+  hoverT = null;     // nouveau contexte : la légende live reprend la main
   $('dot').classList.remove('live');
   const retry = () => {   // échec ≠ app morte : backoff 5 s → 30 s tant que rien ne nous a supplantés
     retryTimer = setTimeout(() => { if (seq === loadSeq && !replay) load(keepZoom, attempt + 1); },
@@ -648,8 +654,27 @@ async function load(keepZoom = false, attempt = 0) {
     dataCtx = symbol + '|' + tf;
     setPrecision(candles.at(-1).close);
     setAll(candles);
-    if (!keepZoom) ts().resetTimeScale();
-    snapToLive();
+    if (keepRange && keepRange.from != null) {
+      /* changement de TF : on reste sur la MÊME fenêtre temporelle (comme TV) ;
+         backfill borné si le nouveau TF ne couvre pas encore la zone regardée */
+      const target = keepRange.from;
+      let grew = false;
+      for (let g = 0; candles[0].time > target && candles.length < MAX_BARS && g < 8; g++) {
+        const older = await fetchOlder(1500);
+        if (seq !== loadSeq || replay) return;
+        if (!Array.isArray(older) || !older.length) break;
+        candles = older.concat(candles); grew = true;
+      }
+      if (grew) setAll(candles);
+      const from = Math.max(keepRange.from, candles[0].time);
+      const to = Math.min(keepRange.to, candles[candles.length - 1].time + (TFSEC[tf] || 60) * 6);
+      keepRange = null;
+      if (to > from) ts().setVisibleRange({ from, to });
+      else snapToLive();
+    } else {
+      if (!keepZoom) ts().resetTimeScale();
+      snapToLive();
+    }
     refreshTop();
     startWs();
   } catch (e) { if (seq === loadSeq) { toast('Réseau : ' + e.message); retry(); } }
@@ -785,6 +810,7 @@ TFS.forEach(t => {
   b.textContent = tfLabel(t);
   b.onclick = () => {
     if (replay) exitReplay(false);
+    try { keepRange = ts().getVisibleRange(); } catch { keepRange = null; }   // rester où on regarde
     tf = t;
     lsSet('orion-tf', tf);
     document.querySelectorAll('.tfbtn').forEach(x => x.classList.toggle('on', x === b));
@@ -807,6 +833,7 @@ async function setSymbol(v) {
     if (!Array.isArray(k) || !k.length) { toast(`Symbole invalide : ${v}`); return; }
   } catch { if (req === symSeq) toast('Réseau : symbole non vérifié, réessaie'); return; }
   if (replay) exitReplay(false);
+  keepRange = null;   // un changement de symbole ne consomme pas la fenêtre d'un TF raté
   symbol = v;
   lsSet('orion-sym', symbol);
   $('symBtn').textContent = v + ' ▾';
@@ -1012,7 +1039,7 @@ const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
 const tfOk = t => typeof t === 'string' && Object.hasOwn(TFSEC, t);   // TF de zone = 1m → 1M, aligné sur propTf
 /* nomenclature zones (préfixe, style doctrine) : m1…m30, H1…H12, D1, D3, W1, M1 (mensuel) */
-const zLabel = t => (t.endsWith('m') ? 'm' : t.slice(-1).toUpperCase()) + parseInt(t);
+const zLabel = t => (t.endsWith('m') ? 'm' : t.slice(-1).toUpperCase()) + t.slice(0, -1);
 function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
@@ -1202,8 +1229,9 @@ $('propDup').onclick = () => {
 $('propDel').onclick = () => { if (sel != null) deleteDrawing(sel); };
 
 function setProp(k, v) {
-  if (k === 'color' && sel == null && tool === 'rect' && rectKind) rectColor = v;   // choix pour le rect typé, SANS polluer defaultStyle
-  else defaultStyle[k] = v;
+  const r = rectSel();
+  if (k === 'color' && sel == null && tool === 'rect' && rectKind) rectColor = v;   // rect typé armé
+  else if (!(k === 'color' && r && r.kind)) defaultStyle[k] = v;   // rect typé SÉLECTIONNÉ : couleur locale, pas defaultStyle
   if (sel != null) { drawings[sel][k] = v; saveDrawings(); }
   syncPropbar();
 }
@@ -1337,7 +1365,7 @@ document.addEventListener('mousemove', e => {
   const p = snap(lpt(e));
   if (p.t == null || p.price == null) return;
   if (temp.type === 'brush') {
-    if (temp.pts.length >= 3000) return;   // borne dure anti-quota localStorage
+    if (temp.pts.length >= PTS_MAX) return;   // borne dure anti-quota localStorage
     const m = mpos(e);                     // seuil en pixels écran : le prix flottant change à chaque pixel
     if (temp._lx != null && Math.hypot(m.x - temp._lx, m.y - temp._ly) < 3) return;
     temp._lx = m.x; temp._ly = m.y;
@@ -1413,8 +1441,10 @@ function dSeg(mx, my, x1, y1, x2, y2) {
    dès que la lecture atteint sa première ancre, il s'affiche (entier).
    Le min des ancres est immuable hors édition → mémoïsé (les brushes 3000 pts
    seraient sinon re-scannés par frame ET par hit-test) ; le drag invalide. */
-/* énumérateur d'ancres temporelles PARTAGÉ : futureHidden (min) et le drag replay (max)
-   doivent voir la même topologie d'ancres par type de tracé — une seule liste à maintenir */
+/* énumérateur d'ancres temporelles PARTAGÉ : futureHidden (min) et dragExtT (min/max)
+   doivent voir la même topologie d'ancres par type de tracé. ⚠️ Un nouveau type avec des
+   ancres hors {t, a.t, b.t, pts[].t} doit aussi être ajouté à : propDup.shift, drawingOk,
+   et le dispatch de drag — sinon révélation replay / clamp / duplication divergent. */
 function anchorTs(d, pick) {
   if (d.pts) { let m = null; for (const p of d.pts) m = m == null ? p.t : pick(m, p.t); return m; }
   let m = null;
@@ -1636,11 +1666,12 @@ function drawOne(d, isSel) {
   const noGlow = d.type === 'long' || d.type === 'short' || d.type === 'measure';
   ctx.shadowColor = col;
   ctx.shadowBlur = hudGlow && !noGlow ? (isSel ? 12 : 6) : 0;   // long/short/règle : JAMAIS de halo, même sélectionnés
+  const ambGlow = ctx.shadowBlur;   // les petits textes repassent à net (le halo floute la typo)
   if (d.type === 'hline') {
     const y = series.priceToCoordinate(d.price);
     if (y != null) {
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(paneW(), y); ctx.stroke();
-      ctx.setLineDash([]); ctx.fillStyle = col; ctx.fillText(fmt(d.price), 6, y - 4);
+      ctx.setLineDash([]); ctx.shadowBlur = 0; ctx.fillStyle = col; ctx.fillText(fmt(d.price), 6, y - 4);
     }
   } else if (d.type === 'vline') {
     const x = xOf(d.t);
@@ -1649,11 +1680,11 @@ function drawOne(d, isSel) {
     const [x, y] = px(d);
     if (x != null && y != null) {
       ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(paneW(), y); ctx.stroke();
-      ctx.setLineDash([]); ctx.fillStyle = col; ctx.fillText(fmt(d.price), x + 6, y - 4);
+      ctx.setLineDash([]); ctx.shadowBlur = 0; ctx.fillStyle = col; ctx.fillText(fmt(d.price), x + 6, y - 4);
     }
   } else if (d.type === 'text') {
     const [x, y] = px(d);
-    if (x != null && y != null) { ctx.fillStyle = col; ctx.font = '12px Segoe UI'; ctx.fillText(d.text, x, y); }
+    if (x != null && y != null) { ctx.shadowBlur = Math.min(ambGlow, 2); ctx.fillStyle = col; ctx.font = '12px Segoe UI'; ctx.fillText(d.text, x, y); }
   } else if (d.type === 'brush') {
     ctx.beginPath();
     let started = false;
@@ -1765,8 +1796,9 @@ function drawOne(d, isSel) {
           if (y == null) return;
           ctx.lineWidth = r === .5 ? (d.width || 1.5) + .7 : (d.width || 1.5);
           ctx.beginPath(); ctx.moveTo(xa, y); ctx.lineTo(xb, y); ctx.stroke();
-          ctx.fillStyle = col;
+          ctx.shadowBlur = 0; ctx.fillStyle = col;
           ctx.fillText(`${r}  ${fmt(price)}`, xb + 5, y + 3);
+          ctx.shadowBlur = ambGlow;   // la ligne du niveau suivant garde son glow
         });
       } else if (d.type === 'measure') {
         const up = d.b.price >= d.a.price;
@@ -1848,8 +1880,11 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
   if (lastPriceTxt !== lastPriceShown) { $('lastPrice').textContent = lastPriceShown = lastPriceTxt; }
   /* measure est statique une fois posée (ancrée t/prix, la vue invalide déjà) :
      plus de redraw 60 fps permanent tant qu'une règle reste affichée.
-     redrawStreak : pendant une interaction continue (pan/drag), le glow des rects
-     est coupé (shadowBlur coûteux) et rétabli par une frame de finition. */
+     redrawStreak : pendant une interaction POINTEUR continue (pan/drag), le glow de TOUS
+     les tracés est coupé (shadowBlur coûteux) et rétabli par une frame de finition.
+     Limite connue : les redraws pilotés par les ticks/replay gardent le glow — si ça
+     devient un coût (WS actif + scène chargée), l'axe correct est un calque offscreen
+     re-blitté, PAS un gating sur la continuité des redraws (ça tuerait le glow en live). */
   const active = dirty || drag || temp || (replay && replay.picking);
   const polish = !active && redrawStreak > 2;
   if (!active) redrawStreak = 0;
@@ -1891,15 +1926,18 @@ wrap.addEventListener('dblclick', invalidate);               // reset d'échelle
 let oldErrUntil = 0;   // pause après une erreur API (ban 429/418) : pas de tempête de requêtes au bord gauche
 ts().subscribeVisibleLogicalRangeChange(async r => {
   // contexte périmé (backoff après changement TF/symbole) : tout fetch mélangerait deux actifs
-  if (!r || r.from > 30 || replay || ctxBusy() || loadingOld || oldestDone || Date.now() < oldErrUntil || !candles.length) return;
+  if (!r || r.from > 30 || replay || ctxBusy() || loadingOld || oldestDone || Date.now() < oldErrUntil
+      || !candles.length || candles.length >= MAX_BARS) return;   // plein : pas de fetch pour rien
   loadingOld = true;
   try {
     let older = await fetchOlder(1500);          // max Binance : 3× moins de reconstructions qu'à 500
     if (replay) return;                          // supplanté pendant le fetch
-    if (older === 'err') { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
+    if (older === FETCH_ERR) { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
     if (older == null) return;                   // contexte périmé (seq/tête) → réponse jetée
-    if (candles.length + older.length > MAX_BARS) {   // ne JAMAIS franchir le plafond : sinon le prochain
-      older = older.slice(older.length - Math.max(0, MAX_BARS - candles.length));   // tick live raserait la tête
+    const room = MAX_BARS - candles.length;      // ne JAMAIS franchir le plafond : le cap live raserait la tête
+    if (room <= 0) return;                       // plein TRANSITOIREMENT (dérive live) : on ne verrouille pas
+    if (older.length >= room) {                  // >= : couvre le cas limite exact, sans requête fantôme ensuite
+      older = older.slice(older.length - room);
       oldestDone = true;
     }
     if (!older.length) { oldestDone = true; return; }
@@ -1916,6 +1954,7 @@ try {
   applyTheme(valid ? st : { ...THEMES.or }, false);
 } catch { applyTheme({ ...THEMES.or }, false); }
 document.querySelectorAll('.tool[data-tip]').forEach(b => b.setAttribute('aria-label', b.dataset.tip));
+$('txtIn').maxLength = TEXT_MAX;   // la constante fait foi, pas l'attribut HTML
 $('symBtn').textContent = symbol + ' ▾';   // reflète le symbole restauré
 sizeCv();
 syncPropbar();
