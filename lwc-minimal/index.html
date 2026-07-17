@@ -761,7 +761,9 @@ async function load(keepZoom = false, attempt = 0) {
       setAll(candles);
       const from = Math.max(target, candles[0].time);   // clampé en silence si l'historique ne couvre pas tout
       const to = Math.min(targetTo, candles[candles.length - 1].time + (TFSEC[tf] || 60) * 6);
-      if (to > from) ts().setVisibleRange({ from, to }); else snapToLive();
+      const nb = (to - from) / (TFSEC[tf] || 60);   // combien de bougies du NOUVEAU TF tiennent dans la fenêtre
+      if (to > from && nb >= 20 && nb <= 3000) ts().setVisibleRange({ from, to });
+      else { ts().resetTimeScale(); snapToLive(); }   // échelles trop éloignées (ex. 15s↔1h) : cadrage par défaut, pas de zoom fou
     } else {
       setAll(candles);
       if (!keepZoom) ts().resetTimeScale();
