@@ -456,6 +456,7 @@ const atrSeries = chart.addSeries(LWC.LineSeries, {
 });
 atrSeries.priceScale().applyOptions({ scaleMargins: { top: .93, bottom: .01 } });
 let lastAtr = null, indTrs = [], indSum = 0, indStale = false, indTimer = null, indSince = 0;
+const IND_MAX_STALE = 1000;   // fenêtre max sans recalcul ATR (scroll continu / onglet throttlé) — source unique
 function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chemin par-bougie passe par updateInd
   clearTimeout(indTimer); indTimer = null;   // le nettoyeur annule le déclencheur : pas de recompute orphelin
   indStale = false;
@@ -475,7 +476,7 @@ function computeInd() {   // reconstruction complète (setAll/fillGap) ; le chem
 }
 function updateInd(prev, bar, isNew) {   // O(1) : ne touche que la dernière bougie (somme glissante persistée)
   if (indStale) {   // fenêtre désalignée après un prepend différé
-    if (Date.now() - indSince > 1500) computeInd();   // onglet throttlé : le timer peut ne jamais venir
+    if (Date.now() - indSince > IND_MAX_STALE) computeInd();   // onglet throttlé : le timer peut ne jamais venir
     return;
   }
   const tr = prev
@@ -549,7 +550,7 @@ function setAllDeferInd(arr) {
   if (!indStale) indSince = Date.now();
   indStale = true;
   clearTimeout(indTimer);
-  if (Date.now() - indSince > 1000) computeInd();
+  if (Date.now() - indSince > IND_MAX_STALE) computeInd();
   else indTimer = setTimeout(computeInd, 400);
   invalidate();
 }
@@ -579,7 +580,9 @@ function applyBar(bar) {
    seq bumpé, contexte changé, tête déplacée par un cap-slice) */
 async function fetchOlder(limit, ms = 10000) {
   const seq = loadSeq, endT = candles[0].time * 1000 - 1;
-  const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=${limit}&endTime=${endT}`, ms);
+  let k;
+  try { k = await fetchJson(`${REST}?symbol=${symbol}&interval=${tf}&limit=${limit}&endTime=${endT}`, ms); }
+  catch { return 'err'; }   // réseau/timeout : même canal que l'erreur API — les appelants n'ont plus de try/catch
   if (!Array.isArray(k)) return 'err';
   if (seq !== loadSeq || !ctxFresh() || !candles.length || candles[0].time * 1000 - 1 !== endT) return null;
   const first = candles[0].time;
@@ -852,8 +855,7 @@ async function enterReplay() {
        scroll est pickable, et l'entrée ne déplace pas la vue (mêmes données).
        On complète seulement si on en a peu (page fraîche = 500). */
     if (candles.length < 1500) {   // marge de pick sur page fraîche — BEST-EFFORT : hors-ligne, on entre quand même
-      let older = null;
-      try { older = await fetchOlder(1000, 4000); } catch {}
+      const older = await fetchOlder(1000, 4000);
       if (seq !== loadSeq) return;               // symbole/TF changé pendant le fetch
       if (Array.isArray(older) && older.length) candles = older.concat(candles);
     }
@@ -1010,7 +1012,7 @@ const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
 const tfOk = t => typeof t === 'string' && Object.hasOwn(TFSEC, t);   // TF de zone = 1m → 1M, aligné sur propTf
 /* nomenclature zones (préfixe, style doctrine) : m1…m30, H1…H12, D1, D3, W1, M1 (mensuel) */
-const zLabel = t => t.endsWith('m') ? 'm' + parseInt(t) : t === '1M' ? 'M1' : t.slice(-1).toUpperCase() + parseInt(t);
+const zLabel = t => (t.endsWith('m') ? 'm' : t.slice(-1).toUpperCase()) + parseInt(t);
 function drawingOk(d) {
   if (!d || typeof d.type !== 'string') return false;
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
@@ -1411,6 +1413,19 @@ function dSeg(mx, my, x1, y1, x2, y2) {
    dès que la lecture atteint sa première ancre, il s'affiche (entier).
    Le min des ancres est immuable hors édition → mémoïsé (les brushes 3000 pts
    seraient sinon re-scannés par frame ET par hit-test) ; le drag invalide. */
+/* énumérateur d'ancres temporelles PARTAGÉ : futureHidden (min) et le drag replay (max)
+   doivent voir la même topologie d'ancres par type de tracé — une seule liste à maintenir */
+function anchorTs(d, pick) {
+  if (d.pts) { let m = null; for (const p of d.pts) m = m == null ? p.t : pick(m, p.t); return m; }
+  let m = null;
+  for (const v of [d.a && d.a.t, d.b && d.b.t, d.t]) if (v != null) m = m == null ? v : pick(m, v);
+  return m;
+}
+function dragMaxT(o, part) {   // ancre max réellement déplacée par un drag (miroir de futureHidden)
+  if (part === 'a' || part === 'b') return o[part] && o[part].t != null ? o[part].t : null;
+  if (part === 'target' || part === 'stop' || part === 'c') return null;   // prix seul
+  return anchorTs(o, Math.max);
+}
 const minTCache = new WeakMap();
 function futureHidden(d) {
   if (!replay) return false;
@@ -1418,13 +1433,7 @@ function futureHidden(d) {
   if (!head) return false;
   if (d.type === 'hline') return false;   // pas d'ancre temporelle
   let mt = minTCache.get(d);
-  if (mt === undefined) {
-    if (d.pts) { mt = Infinity; for (const p of d.pts) if (p.t < mt) mt = p.t; }
-    else if (d.a) mt = d.b && d.b.t != null ? Math.min(d.a.t, d.b.t) : d.a.t;
-    else mt = d.t;
-    minTCache.set(d, mt ?? null);   // WeakMap.get renvoie undefined sur absence : on stocke null pour distinguer
-    mt = mt ?? null;
-  }
+  if (mt === undefined) minTCache.set(d, mt = anchorTs(d, Math.min) ?? null);   // undefined = absent, null = sans ancre
   return mt != null && mt > head.time;
 }
 function hitTest(mx, my) {
@@ -1542,21 +1551,18 @@ document.addEventListener('mousemove', e => {
     let dx = m.x - drag.x0;
     const dy = m.y - drag.y0;
     const d = drawings[drag.i], o = drag.orig;
+    const lim = dataNow().length + 2000;   // borne d'extrapolation, invariante sur le mousemove
     if (replay) {
       /* butée RIGIDE contre la tête de lecture : on plafonne le delta partagé, pas chaque
          ancre — sinon un drag de corps écrase le tracé (les ancres s'empilent sur la tête) */
       const h = curBar();
-      const mts = (() => {   // ancre max réellement déplacée par ce drag
-        if (drag.part === 'a' || drag.part === 'b') return o[drag.part] && o[drag.part].t != null ? o[drag.part].t : null;
-        if (drag.part === 'target' || drag.part === 'stop' || drag.part === 'c') return null;   // prix seul
-        if (o.pts) { let mx2 = -Infinity; for (const p of o.pts) if (p.t > mx2) mx2 = p.t; return mx2; }
-        let mm = null;
-        for (const v of [o.a && o.a.t, o.b && o.b.t, o.t]) if (v != null) mm = mm == null ? v : Math.max(mm, v);
-        return mm;
-      })();
-      if (h && mts != null) {
-        const lh = lOf(h.time), lm = lOf(mts);
-        if (lh != null && lm != null) dx = Math.min(dx, Math.max((lh - lm) * (barSp || 6), 0));
+      if (!('maxL' in drag)) {   // invariants du drag (orig/part figés au mousedown) : calculés UNE fois
+        const mts = dragMaxT(o, drag.part);
+        drag.maxL = mts != null ? lOf(mts) : null;
+      }
+      if (h && drag.maxL != null) {
+        const lh = lOf(h.time);
+        if (lh != null) dx = Math.min(dx, Math.max((lh - drag.maxL) * barSp, 0));
       }
     }
     const mvT = t => {
@@ -1565,9 +1571,7 @@ document.addEventListener('mousemove', e => {
          borné : pas d'ancre expédiée à des milliers d'écrans des données */
       const l = lOf(t);
       if (l == null) return t;
-      const len = dataNow().length;
-      const nl = Math.max(-(len + 2000), Math.min(len + 2000, l + dx / (barSp || 6)));
-      const nt = tOf(nl);
+      const nt = tOf(Math.max(-lim, Math.min(lim, l + dx / barSp)));
       return nt != null ? nt : t;
     };
     const mvP = p => { const c = series.priceToCoordinate(p); const np = c != null ? series.coordinateToPrice(c + dy) : null; return np != null ? np : p; };
@@ -1884,17 +1888,15 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
   if (!r || r.from > 30 || replay || ctxBusy() || loadingOld || oldestDone || Date.now() < oldErrUntil || !candles.length) return;
   loadingOld = true;
   try {
-    let older;
-    try { older = await fetchOlder(1500); } catch { older = 'err'; }   // max Binance : 3× moins de reconstructions
+    let older = await fetchOlder(1500);          // max Binance : 3× moins de reconstructions qu'à 500
     if (replay) return;                          // supplanté pendant le fetch
     if (older === 'err') { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
     if (older == null) return;                   // contexte périmé (seq/tête) → réponse jetée
-    if (!older.length) { oldestDone = true; return; }
     if (candles.length + older.length > MAX_BARS) {   // ne JAMAIS franchir le plafond : sinon le prochain
       older = older.slice(older.length - Math.max(0, MAX_BARS - candles.length));   // tick live raserait la tête
       oldestDone = true;
-      if (!older.length) return;
     }
+    if (!older.length) { oldestDone = true; return; }
     candles = older.concat(candles);
     setAllDeferInd(candles);
     if (older.length < 1500) oldestDone = true;
