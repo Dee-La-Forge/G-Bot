@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>ORION — Futures Perp</title>
+<title>G-Bot — Futures Perp</title>
 <style>
   :root {
     --bg: #060604; --panel: #0c0b07; --border: #26200e;
@@ -17,10 +17,20 @@
     background: linear-gradient(180deg, #0e0d08, #080704); border-bottom: 1px solid var(--border);
   }
   #brand {
+    display: flex; align-items: center; gap: 8px;
     font-weight: 700; letter-spacing: 3px; font-size: 13px; white-space: nowrap;
     background: linear-gradient(90deg, #f5e3a0, #d9b64d, #9a7b33);
     -webkit-background-clip: text; background-clip: text; color: transparent;
     text-shadow: 0 0 18px rgba(217,182,77,.25);
+  }
+  #brandWrap {
+    width: 34px; height: 34px; border-radius: 50%; overflow: hidden;
+    flex: none; position: relative;
+    box-shadow: 0 0 10px rgba(217,182,77,.3);
+  }
+  #brandLogo {
+    /* l'emblème occupe le centre du PNG carré : on recadre sur les 50 % centraux */
+    width: 200%; height: 200%; position: absolute; left: -50%; top: -50%;
   }
   #symWrap { position: relative; }
   #symBtn {
@@ -106,6 +116,15 @@
   #chartwrap { position: relative; flex: 1; }
   #chart { position: absolute; inset: 0; }
   #overlay { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
+  #watermark {
+    position: absolute; left: 10px; bottom: 36px; width: 84px; height: 84px;
+    border-radius: 50%; overflow: hidden; z-index: 4; pointer-events: none; opacity: .9;
+    box-shadow: 0 0 16px rgba(217,182,77,.25), inset 0 0 0 1px var(--gold-d);
+  }
+  #watermark img {
+    /* recadrage sur les 50 % centraux du PNG : l'emblème remplit le cercle */
+    width: 200%; height: 200%; position: absolute; left: -50%; top: -50%;
+  }
   #legend {
     position: absolute; top: 10px; left: 12px; z-index: 6; pointer-events: none;
     font-size: 12px; letter-spacing: .5px; color: #b39a55; text-shadow: 0 1px 3px #000;
@@ -196,7 +215,7 @@
 </head>
 <body>
 <div id="topbar">
-  <div id="brand">◆ ORION · PERP</div>
+  <div id="brand"><span id="brandWrap"><img id="brandLogo" src="logo.png" alt="G-Bot"></span></div>
   <div id="symWrap">
     <button id="symBtn">BTCUSDT ▾</button>
     <div id="symPanel" hidden>
@@ -281,6 +300,7 @@
   </div>
   <div id="chartwrap">
     <div id="chart"></div>
+    <span id="watermark"><img src="logo.png" alt=""></span>
     <canvas id="overlay"></canvas>
     <div id="legend"></div>
     <div id="countdown" hidden><div class="cdP"></div><div class="cdT"></div></div>
@@ -367,7 +387,7 @@ let tool = 'cursor', magnet = false, showDraw = true;
 /* ---------- chart ---------- */
 const chart = LWC.createChart($('chart'), {
   autoSize: true,
-  layout: { background: { color: '#060604' }, textColor: '#9d8a52', fontSize: 11 },
+  layout: { background: { color: '#060604' }, textColor: '#9d8a52', fontSize: 11, attributionLogo: false },
   grid: { vertLines: { color: '#12100a' }, horzLines: { color: '#12100a' } },
   crosshair: {
     mode: LWC.CrosshairMode.Normal,
