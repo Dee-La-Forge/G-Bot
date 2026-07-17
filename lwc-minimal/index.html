@@ -611,7 +611,26 @@ function tradesToBars(trades) {   // TF secondes : seaux construits depuis les a
   }
   return out;
 }
-let lastTradeMs = 0;   // curseur du flux aggTrades (TF secondes)
+let lastTradeMs = 0;     // curseur avant du flux aggTrades (TF secondes)
+let firstTradeId = null; // curseur ARRIÈRE (pagination fromId du scroll-back secondes)
+/* scroll-back des TF secondes : 5 pages de trades en arrière par déclenchement.
+   'end' = genèse atteinte ; null = réessayer plus tard (erreur/contexte) */
+async function fetchOlderSec() {
+  const seq = loadSeq;
+  let trs = [], id = firstTradeId;
+  for (let g = 0; g < 5 && id > 1; g++) {
+    const prev = await fetchJson(`${AGGT}?symbol=${symbol}&fromId=${Math.max(0, id - 1000)}&limit=1000`, 8000).catch(() => null);
+    if (seq !== loadSeq || !ctxFresh()) return null;
+    if (!Array.isArray(prev) || !prev.length) break;
+    const older = prev.filter(t => t.a < id);
+    if (!older.length) break;
+    trs = older.concat(trs);
+    id = trs[0].a;
+  }
+  if (!trs.length) return id <= 1 ? 'end' : null;
+  firstTradeId = id;
+  return tradesToBars(trs);
+}
 function applyTrade(price, q, tSec) {   // un trade → le seau courant (créé au besoin)
   const last = candles[candles.length - 1];
   const bt = bucketStart(tSec);
@@ -737,6 +756,7 @@ async function load(keepZoom = false, attempt = 0) {
       let tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
       if (Array.isArray(tr) && tr.length) {
         lastTradeMs = tr[tr.length - 1].T;
+        firstTradeId = tr[0].a;
         const needMs = 400 * (TFSEC[tf] || 15) * 1000;   // couverture visée ≈ 400 seaux
         for (let g = 0; g < 15; g++) {                    // best-effort : borné par l'activité du symbole
           if (tr[tr.length - 1].T - tr[0].T >= needMs || tr[0].a <= 1) break;
@@ -747,6 +767,7 @@ async function load(keepZoom = false, attempt = 0) {
           const older = prev.filter(t => t.a < firstId);
           if (!older.length) break;
           tr = older.concat(tr);
+          firstTradeId = tr[0].a;
         }
         k = tradesToBars(tr);
       } else k = tr;
@@ -754,7 +775,6 @@ async function load(keepZoom = false, attempt = 0) {
     if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
     if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); retry(); return; }
     candles = k;
-    if (isSecTf()) oldestDone = true;   // pas de scroll-back en secondes
     bucketVols = new Map();
     dataCtx = symbol + '|' + tf;
     // TF agrégés (4m, 8m…) : le premier fetch plafonné à 1500 bougies SOURCE peut être court →
@@ -2112,10 +2132,27 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
       || !candles.length || candles.length >= MAX_BARS) return;   // plein : pas de fetch pour rien
   loadingOld = true;
   try {
-    let older = await fetchOlder(1500);          // max Binance : 3× moins de reconstructions qu'à 500
-    if (replay) return;                          // supplanté pendant le fetch
-    if (older === FETCH_ERR) { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
-    if (older == null) return;                   // contexte périmé (seq/tête) → réponse jetée
+    let older;
+    if (isSecTf()) {                             // secondes : pagination arrière des trades, à la demande du scroll
+      older = await fetchOlderSec();
+      if (replay) return;
+      if (older === 'end') { oldestDone = true; return; }
+      if (older == null) return;                 // erreur/contexte : on retentera au prochain scroll
+      const head = candles[0], lastNew = older[older.length - 1];
+      if (lastNew && head && lastNew.time === head.time) {   // fusion du seau frontière (trades du même seau)
+        head.open = lastNew.open;
+        if (lastNew.high > head.high) head.high = lastNew.high;
+        if (lastNew.low < head.low) head.low = lastNew.low;
+        head.volume += lastNew.volume;
+        older.pop();
+      }
+      if (!older.length) return;
+    } else {
+      older = await fetchOlder(1500);            // max Binance : 3× moins de reconstructions qu'à 500
+      if (replay) return;                        // supplanté pendant le fetch
+      if (older === FETCH_ERR) { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
+      if (older == null) return;                 // contexte périmé (seq/tête) → réponse jetée
+    }
     const room = MAX_BARS - candles.length;      // ne JAMAIS franchir le plafond : le cap live raserait la tête
     if (room <= 0) return;                       // plein TRANSITOIREMENT (dérive live) : on ne verrouille pas
     if (older.length >= room) {                  // >= : couvre le cas limite exact, sans requête fantôme ensuite
@@ -2125,7 +2162,7 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
     if (!older.length) { oldestDone = true; return; }
     candles = older.concat(candles);
     setAllDeferInd(candles);
-    if (older.length < 1500) oldestDone = true;
+    if (!isSecTf() && older.length < 1500) oldestDone = true;
   } catch {} finally { loadingOld = false; }
 });
 
