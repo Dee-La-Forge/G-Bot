@@ -559,6 +559,14 @@ async function fillGap() {
   } catch {} finally { gapFilling = false; }
 }
 
+/* positionnement INSTANTANÉ au bord droit : scrollToRealTime anime via rAF
+   (gelé fenêtre occluse, interminable depuis l'historique) → jamais fiable ici */
+function snapToLive() {
+  const n = dataNow().length;
+  if (!n) return;
+  const bars = Math.max(20, paneW() / (ts().options().barSpacing || 6));
+  ts().setVisibleLogicalRange({ from: n - 1 + 6 - bars, to: n - 1 + 6 });
+}
 let loading = false, retryTimer = null;
 async function load(keepZoom = false, attempt = 0) {
   const seq = ++loadSeq;
@@ -580,7 +588,7 @@ async function load(keepZoom = false, attempt = 0) {
     setPrecision(candles.at(-1).close);
     setAll(candles);
     if (!keepZoom) ts().resetTimeScale();
-    ts().scrollToRealTime();
+    snapToLive();
     refreshTop();
     startWs();
   } catch (e) { if (seq === loadSeq) { toast('Réseau : ' + e.message); retry(); } }
@@ -770,15 +778,25 @@ document.addEventListener('mousedown', e => {   // fermeture au clic extérieur 
 let replayLoading = false;
 async function enterReplay() {
   if (replay || replayLoading) return;
+  if (!candles.length) { toast('Replay : données pas encore chargées'); return; }
   replayLoading = true;
   const seq = loadSeq;
   try {
-    const r = await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=1000`);
-    const k = await r.json();
-    if (seq !== loadSeq || replay) return;       // symbole/TF changé pendant le fetch
-    if (!Array.isArray(k) || !k.length) { toast('Replay : historique indisponible'); return; }
+    /* le replay rejoue les bougies DÉJÀ chargées : tout l'historique parcouru au
+       scroll est pickable, et l'entrée ne déplace pas la vue (mêmes données).
+       On complète seulement si on en a peu (page fraîche = 500). */
+    if (candles.length < 1500) {
+      const k = await (await fetch(`${REST}?symbol=${symbol}&interval=${tf}&limit=1000&endTime=${candles[0].time * 1000 - 1}`)).json();
+      if (seq !== loadSeq || replay) return;     // symbole/TF changé pendant le fetch
+      if (Array.isArray(k)) {
+        const first = candles[0].time;
+        const older = k.map(mapK).filter(b => b.time < first);
+        if (older.length) candles = older.concat(candles);
+      }
+    }
+    if (!candles.length) { toast('Replay : historique indisponible'); return; }
     resetTool();                                 // le pick se fait toujours au curseur
-    replay = { data: k.map(mapK), i: k.length - 1, playing: false, timer: null, picking: true };
+    replay = { data: candles.slice(), i: candles.length - 1, playing: false, timer: null, picking: true };
     setAll(replay.data);
     $('replayBtn').classList.add('on');
     $('replaybar').hidden = false; $('hint').hidden = false;
@@ -793,6 +811,10 @@ function pickAt(time) {
   replay.i = i; replay.picking = false; curtainX = null;
   $('hint').hidden = true;
   setAll(replay.data.slice(0, i + 1));
+  /* cadrage explicite et instantané : la bougie de départ reste en vue, marge à droite
+     (sans ça, LWC ré-ancre la vue au bord droit des données tronquées → saut imprévisible) */
+  const bars = Math.max(20, paneW() / (ts().options().barSpacing || 6));
+  ts().setVisibleLogicalRange({ from: i - bars * .7, to: i + bars * .3 });
   legend(replay.data[i]);
 }
 function rpStep() {
