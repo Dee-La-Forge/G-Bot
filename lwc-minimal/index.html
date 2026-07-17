@@ -387,7 +387,17 @@ const REST = 'https://fapi.binance.com/fapi/v1/klines';
 const WSS  = 'wss://fstream.binance.com/stream';
 const SYM_RE = /^[A-Z0-9_]{2,20}$/;   // format symbole — source unique (setSymbol + restauration)
 const TEXT_MAX = 500, PTS_MAX = 3000; // bornes des tracés — source unique (création, validation, chargement)
-const fetchJson = (url, ms = 10000) => fetch(url, { signal: AbortSignal.timeout(ms) }).then(r => r.json());
+const KL_PAGE = 1000;   // taille de page klines : poids Binance 5 (vs 10 à 1500) → 2× moins cher par bougie
+let apiCoolUntil = 0;   // ban 429/418 : PLUS AUCUNE requête ne part avant l'échéance (Retry-After respecté)
+const fetchJson = async (url, ms = 10000) => {
+  if (Date.now() < apiCoolUntil) throw new Error('rate-limit en cours');
+  const r = await fetch(url, { signal: AbortSignal.timeout(ms) });
+  if (r.status === 429 || r.status === 418) {
+    apiCoolUntil = Date.now() + ((+r.headers.get('retry-after') || 30) * 1000);
+    throw new Error('Binance ' + r.status + ' — pause ' + Math.round((apiCoolUntil - Date.now()) / 1000) + 's');
+  }
+  return r.json();
+};
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 /* table des TF : sec = durée (extrapolation/chrono), src = intervalle Binance NATIF servant de
    source, fact = facteur d'agrégation. src 'agg' = construit en direct depuis les aggTrades
@@ -448,6 +458,14 @@ try {   // dernier contexte : on rouvre là où on travaillait, pas en 1m/BTC
 } catch {}
 let candles = [];
 let ws = null, loadSeq = 0;
+const barCache = new Map();   // symbol|tf → {candles, oldestDone, firstTradeId, lastTradeMs} : re-visite = INSTANTANÉ
+function cacheBars() {   // photographie le contexte courant avant de le quitter (LRU 6 entrées)
+  if (!candles.length || !ctxFresh()) return;
+  barCache.delete(dataCtx);
+  // SNAPSHOT du tableau (slice) : aucun mutateur asynchrone tardif ne peut toucher l'entrée cachée
+  barCache.set(dataCtx, { candles: candles.slice(), oldestDone, firstTradeId, lastTradeMs, lastAggId });
+  if (barCache.size > 6) barCache.delete(barCache.keys().next().value);
+}
 let dataCtx = '';   // contexte des candles chargées ; ≠ symbol|tf courant pendant un backoff = données périmées
 const ctxFresh = () => dataCtx === symbol + '|' + tf;
 const ctxBusy = () => loading || !ctxFresh();   // données absentes, en cours, ou d'un autre contexte
@@ -593,7 +611,7 @@ function rollup(bars) {   // agrège des bougies SOURCE en seaux du TF courant (
 /* bougies du TF courant : fetch l'intervalle SOURCE puis agrège ; passe l'objet {code,msg} inchangé */
 async function fetchK(extra, limitAgg, ms) {
   const d = tfDef();
-  const lim = Math.min(1500, limitAgg * (d.fact || 1));
+  const lim = Math.min(KL_PAGE, limitAgg * (d.fact || 1));
   const k = await fetchJson(`${REST}?symbol=${symbol}&interval=${d.src}&limit=${lim}${extra}`, ms);
   if (!Array.isArray(k)) return k;
   return rollup(k.map(mapK));
@@ -611,25 +629,60 @@ function tradesToBars(trades) {   // TF secondes : seaux construits depuis les a
   }
   return out;
 }
-let lastTradeMs = 0;     // curseur avant du flux aggTrades (TF secondes)
+let lastTradeMs = 0;     // horodatage du dernier trade vu (TF secondes)
+let lastAggId = 0;       // curseur AVANT par id de trade (startTime en ms SAUTE des trades intra-milliseconde)
 let firstTradeId = null; // curseur ARRIÈRE (pagination fromId du scroll-back secondes)
+const OLDEST = Symbol('oldest');   // genèse atteinte — Symbol, pas une string truthy avec .length
+/* pages d'aggTrades en ARRIÈRE (fromId), parallèles, dédupliquées, triées — partagé load/scroll-back */
+async function fetchTradesBack(firstId, pages) {
+  const ids = [];
+  for (let g = 1; g <= pages; g++) { const f = Math.max(0, firstId - 1000 * g); ids.push(f); if (f === 0) break; }
+  const rs = await Promise.all(ids.map(f => fetchJson(`${AGGT}?symbol=${symbol}&fromId=${f}&limit=1000`, 12000).catch(() => null)));
+  const seen = new Set(), older = [];
+  for (const r of rs) if (Array.isArray(r)) for (const t of r) if (t.a < firstId && !seen.has(t.a)) { seen.add(t.a); older.push(t); }
+  older.sort((a, b) => a.a - b.a);
+  return { trades: older, healthy: rs.every(r => Array.isArray(r)) };
+}
+function applyTrades(tr) {   // paquet de trades → quelques applyBar par SEAU (jamais 1000 updates LWC par tick)
+  const bars = tradesToBars(tr);
+  for (const b of bars) {
+    const last = candles[candles.length - 1];
+    if (last && b.time === last.time)
+      applyBar({ time: b.time, open: last.open, high: Math.max(last.high, b.high), low: Math.min(last.low, b.low), close: b.close, volume: last.volume + b.volume });
+    else applyBar(b);
+  }
+  lastTradeMs = tr[tr.length - 1].T;
+  lastAggId = tr[tr.length - 1].a;
+}
+/* rattrapage AVANT des TF secondes (retour de cache, trou WS) — par id, ordonné, batché */
+async function fillGapSec() {
+  if (gapFilling || ctxBusy() || !isSecTf() || !candles.length || !lastAggId) return;
+  gapFilling = true;
+  const seq = loadSeq;
+  try {
+    for (let round = 0; round < 20; round++) {
+      const tr = await fetchJson(`${AGGT}?symbol=${symbol}&fromId=${lastAggId + 1}&limit=1000`, 10000);
+      if (seq !== loadSeq || replay || !Array.isArray(tr) || !tr.length) break;
+      applyTrades(tr);
+      if (tr.length < 1000) break;
+    }
+  } catch {} finally { gapFilling = false; }
+}
+function fillGapSecSoon() {   // même throttle que fillGapSoon
+  const n = Date.now();
+  if (n - lastGapReq < 2000) return;
+  lastGapReq = n; fillGapSec();
+}
 /* scroll-back des TF secondes : 5 pages de trades en arrière par déclenchement.
    'end' = genèse atteinte ; null = réessayer plus tard (erreur/contexte) */
 async function fetchOlderSec() {
-  const seq = loadSeq;
-  let trs = [], id = firstTradeId;
-  for (let g = 0; g < 5 && id > 1; g++) {
-    const prev = await fetchJson(`${AGGT}?symbol=${symbol}&fromId=${Math.max(0, id - 1000)}&limit=1000`, 8000).catch(() => null);
-    if (seq !== loadSeq || !ctxFresh()) return null;
-    if (!Array.isArray(prev) || !prev.length) break;
-    const older = prev.filter(t => t.a < id);
-    if (!older.length) break;
-    trs = older.concat(trs);
-    id = trs[0].a;
-  }
-  if (!trs.length) return id <= 1 ? 'end' : null;
-  firstTradeId = id;
-  return tradesToBars(trs);
+  const seq = loadSeq, firstId = firstTradeId;
+  if (firstId == null || firstId <= 1) return OLDEST;
+  const { trades, healthy } = await fetchTradesBack(firstId, 5);
+  if (seq !== loadSeq || !ctxFresh()) return null;
+  if (!trades.length) return healthy ? OLDEST : null;   // vide + pages saines = genèse réelle
+  firstTradeId = trades[0].a;
+  return tradesToBars(trades);
 }
 function applyTrade(price, q, tSec) {   // un trade → le seau courant (créé au besoin)
   const last = candles[candles.length - 1];
@@ -657,6 +710,11 @@ function setAllDeferInd(arr) {
   invalidate();
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden && indStale) computeInd(); });
+addEventListener('pagehide', () => {   // flush des écritures débouncées : F5/fermeture ne perd pas la dernière édition
+  clearTimeout(saveTimer); clearTimeout(themeTimer);
+  try { localStorage.setItem('orion-draw-' + symbol, JSON.stringify(drawings)); } catch {}
+  lsSet('orion-theme', JSON.stringify(theme));
+});
 function refreshTop() {
   const c = candles[candles.length - 1];
   if (!c) return;
@@ -671,6 +729,7 @@ function applyBar(bar) {
     // trou (veille, coupure) → rattrapage REST ; en secondes, un trou = absence de trades : on appende
     if (bar.time > barEnd(last.time) && !isSecTf()) { fillGap(); return; }
     candles.push(bar); isNew = true;
+    bucketVols.clear();   // nouveau seau de tête : les volumes source du précédent ne doivent JAMAIS s'y sommer
     if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); return; }
   } else if (bar.time === last.time) candles[candles.length - 1] = bar;
   else return;
@@ -684,6 +743,25 @@ function applyBar(bar) {
    contexte changé, tête déplacée par un cap-slice). Symbol : un 'err' string serait truthy avec
    .length — un futur appelant naïf le concaténerait dans candles. */
 const FETCH_ERR = Symbol('fetch-err');
+/* pages de klines SOURCE en PARALLÈLE (fenêtres calculées par arithmétique de temps) :
+   un backfill profond coûte ~1 aller-retour au lieu de N séquentiels */
+async function backfillPar(pages) {
+  const d = tfDef();
+  const winMs = TFSEC[d.src] * 1000 * KL_PAGE;
+  const endT = candles[0].time * 1000 - 1;
+  const rs = await Promise.all(Array.from({ length: pages }, (_, k) =>
+    fetchJson(`${REST}?symbol=${symbol}&interval=${d.src}&limit=${KL_PAGE}&endTime=${endT - k * winMs}`, 12000).catch(() => null)));
+  const good = [];
+  for (const r of rs) { if (!Array.isArray(r)) break; good.push(r); }   // préfixe CONTIGU : jamais de trou interne
+  if (!good.length) return FETCH_ERR;   // échec total : signalé, pas silencieux
+  const seen = new Set(), src = [];
+  for (const r of good) for (const x of r) if (!seen.has(x[0])) { seen.add(x[0]); src.push(mapK(x)); }
+  src.sort((a, b) => a.time - b.time);
+  const first = candles[0].time;
+  const bars = rollup(src).filter(b => b.time < first);
+  if ((d.fact || 1) > 1 && bars.length) bars.shift();   // seau le plus ancien potentiellement partiel
+  return bars;
+}
 async function fetchOlder(limit, ms) {
   if (isSecTf()) return null;   // secondes : pas d'historique profond
   const seq = loadSeq, endT = candles[0].time * 1000 - 1;
@@ -718,11 +796,12 @@ async function fillGap() {
         if (b.time === last.time) { candles[candles.length - 1] = b; series.update(b); volSeries.update(volOf(b)); }
         else if (b.time > last.time) { candles.push(b); series.update(b); volSeries.update(volOf(b)); }
       });
+      bucketVols.clear();   // le seau de tête vient d'être reconstruit depuis la source
       if (candles.length > MAX_BARS + 1000) { candles = candles.slice(-MAX_BARS); setAll(candles); }
-      else computeInd();
-      refreshTop(); invalidate();
-      if (k.length < 500) break;
+      // page pleine = KL_PAGE/fact seaux — comparer aux SEAUX, pas aux bougies source
+      if (k.length < Math.floor(KL_PAGE / (tfDef().fact || 1)) - 1) break;
     }
+    computeInd(); refreshTop(); invalidate();   // un seul recalcul à la fin, pas par round
   } catch {} finally { gapFilling = false; }
 }
 
@@ -751,39 +830,48 @@ async function load(keepZoom = false, attempt = 0) {
       Math.min(30000, 5000 * 2 ** attempt));
   };
   try {
-    let k;
-    if (isSecTf()) {   // secondes : construit depuis les aggTrades, pagination arrière bornée pour l'historique
+    let k, fromCache = false;
+    const cached = barCache.get(symbol + '|' + tf);
+    if (cached && cached.candles.length) {   // TF déjà visité : zéro réseau, rattrapage du trou après affichage
+      barCache.delete(symbol + '|' + tf);
+      k = cached.candles;
+      oldestDone = cached.oldestDone;
+      firstTradeId = cached.firstTradeId; lastTradeMs = cached.lastTradeMs; lastAggId = cached.lastAggId || 0;
+      fromCache = true;
+    } else if (isSecTf()) {   // secondes : construit depuis les aggTrades, pagination arrière ADAPTATIVE
       let tr = await fetchJson(`${AGGT}?symbol=${symbol}&limit=1000`);
+      if (seq !== loadSeq || replay) return;   // AVANT d'écrire les curseurs (un load supplanté les clobberait)
       if (Array.isArray(tr) && tr.length) {
-        lastTradeMs = tr[tr.length - 1].T;
-        firstTradeId = tr[0].a;
-        const needMs = 400 * (TFSEC[tf] || 15) * 1000;   // couverture visée ≈ 400 seaux
-        for (let g = 0; g < 15; g++) {                    // best-effort : borné par l'activité du symbole
-          if (tr[tr.length - 1].T - tr[0].T >= needMs || tr[0].a <= 1) break;
-          const prev = await fetchJson(`${AGGT}?symbol=${symbol}&fromId=${Math.max(0, tr[0].a - 1000)}&limit=1000`, 8000);
+        const spanMs = tr[tr.length - 1].T - tr[0].T;
+        const needMs = 500 * tfDef().sec * 1000;   // couverture visée ≈ 500 seaux
+        const pages = spanMs >= needMs ? 0 : Math.min(6, Math.ceil((needMs - spanMs) / Math.max(1, spanMs)));   // plafond 6 : budget de poids API (le scroll complète)
+        if (pages && tr[0].a > 1) {
+          const { trades } = await fetchTradesBack(tr[0].a, pages);
           if (seq !== loadSeq || replay) return;
-          if (!Array.isArray(prev) || !prev.length) break;
-          const firstId = tr[0].a;
-          const older = prev.filter(t => t.a < firstId);
-          if (!older.length) break;
-          tr = older.concat(tr);
-          firstTradeId = tr[0].a;
+          tr = trades.concat(tr);
         }
+        lastTradeMs = tr[tr.length - 1].T;
+        lastAggId = tr[tr.length - 1].a;
+        firstTradeId = tr[0].a;
         k = tradesToBars(tr);
       } else k = tr;
-    } else k = await fetchK('', 500);
+    } else {
+      k = await fetchK('', 500);
+      // 1er seau potentiellement partiel (fenêtre source non alignée) : on l'écarte comme les autres chemins
+      if (Array.isArray(k) && (tfDef().fact || 1) > 1 && k.length > 1) k.shift();
+    }
     if (seq !== loadSeq || replay) return;   // supplanté par un autre load ou par un replay entré entre-temps
     if (!Array.isArray(k) || !k.length) { toast(`Binance Futures : ${(k && k.msg) || 'aucune donnée pour ce symbole'}`); retry(); return; }
     candles = k;
     bucketVols = new Map();
     dataCtx = symbol + '|' + tf;
     // TF agrégés (4m, 8m…) : le premier fetch plafonné à 1500 bougies SOURCE peut être court →
-    // on approfondit jusqu'à ~400-500 seaux avant d'afficher (une seule transition)
-    for (let g = 0; !isSecTf() && candles.length < 400 && !oldestDone && g < 3; g++) {
-      const older = await fetchOlder(1500);
+    // approfondissement en pages PARALLÈLES jusqu'à ~500 seaux avant d'afficher (une seule transition)
+    if (!fromCache && !isSecTf() && candles.length < 400) {
+      const older = await backfillPar(3);
       if (seq !== loadSeq || replay) return;
-      if (!Array.isArray(older) || !older.length) break;
-      candles = older.concat(candles);
+      if (older === FETCH_ERR) oldErrUntil = Date.now() + 30000;   // pas de nouvelle salve immédiate
+      else if (older.length) candles = older.concat(candles);
     }
     setPrecision(candles.at(-1).close);
     if (keepRange && keepRange.from != null) {
@@ -792,19 +880,28 @@ async function load(keepZoom = false, attempt = 0) {
          (curseur busy) et le nouveau apparaît DÉJÀ cadré — une seule transition,
          aucune saccade, aucune popup (demande Meddy). */
       const target = keepRange.from, targetTo = keepRange.to;
-      for (let g = 0; candles[0].time > target && candles.length < MAX_BARS && g < 8; g++) {
-        const older = await fetchOlder(1500);
-        if (seq !== loadSeq || replay) return;
-        if (!Array.isArray(older) || !older.length) break;
-        candles = older.concat(candles);
+      if (!isSecTf() && candles[0].time > target) {
+        const d2 = tfDef();
+        const pages = Math.min(8, Math.ceil((candles[0].time - target) / (TFSEC[d2.src] * KL_PAGE)));
+        if (pages > 0) {   // pages PARALLÈLES : la couverture arrive en ~1 aller-retour
+          const older = await backfillPar(pages);
+          if (seq !== loadSeq || replay) return;
+          if (older === FETCH_ERR) oldErrUntil = Date.now() + 30000;
+          else if (older.length) candles = older.concat(candles);
+        }
       }
       keepRange = null;
       setAll(candles);
       const from = Math.max(target, candles[0].time);   // clampé en silence si l'historique ne couvre pas tout
-      const to = Math.min(targetTo, candles[candles.length - 1].time + (TFSEC[tf] || 60) * 6);
-      const nb = (to - from) / (TFSEC[tf] || 60);   // combien de bougies du NOUVEAU TF tiennent dans la fenêtre
-      if (to > from && nb >= 20 && nb <= 3000) ts().setVisibleRange({ from, to });
-      else { ts().resetTimeScale(); snapToLive(); }   // échelles trop éloignées (ex. 15s↔1h) : cadrage par défaut, pas de zoom fou
+      const to = Math.min(targetTo, candles[candles.length - 1].time + tfDef().sec * 6);
+      // fenêtre CLAMPÉE, jamais abandonnée : le zoom devient sain mais la zone étudiée reste au centre
+      const sec = tfDef().sec, nb = (to - from) / sec;
+      let f2 = from, t2 = to;
+      if (nb < 20) { const c = (from + to) / 2; f2 = c - 10 * sec; t2 = c + 10 * sec; }
+      else if (nb > 3000) f2 = t2 - 3000 * sec;
+      f2 = Math.max(f2, candles[0].time);
+      if (t2 > f2) ts().setVisibleRange({ from: f2, to: t2 });
+      else snapToLive();
     } else {
       setAll(candles);
       if (!keepZoom) ts().resetTimeScale();
@@ -812,6 +909,8 @@ async function load(keepZoom = false, attempt = 0) {
     }
     refreshTop();
     startWs();
+    // rattrapage du trou depuis la mise en cache : APRÈS le finally (loading=false), sinon ctxBusy le tue
+    if (fromCache) setTimeout(() => { if (seq === loadSeq && !replay) (isSecTf() ? fillGapSec() : fillGap()); }, 0);
   } catch (e) { if (seq === loadSeq) { toast('Réseau : ' + e.message); retry(); } }
   finally { if (seq === loadSeq) { loading = false; document.body.classList.remove('busy'); } }
 }
@@ -842,13 +941,16 @@ function startPoll(seq) {
     inFlight = true;
     try {
       let k;
-      if (isSecTf()) k = await fetchJson(`${AGGT}?symbol=${symbol}&startTime=${lastTradeMs + 1}&limit=1000`, 8000);
+      if (isSecTf()) k = await fetchJson(`${AGGT}?symbol=${symbol}&fromId=${lastAggId + 1}&limit=1000`, 8000);   // par ID : startTime en ms saute des trades
       else k = await fetchK('', 2, 8000);
       if (seq !== loadSeq || replay || !candles.length) return;   // replay entré PENDANT le fetch : rien ne fuit
       if (!Array.isArray(k)) { backoff = 15; failed(); return; }   // {code,msg} persistant = flux mort
       fails = 0; $('dot').classList.add('live');
-      if (isSecTf()) for (const t of k) { applyTrade(+t.p, +t.q, t.T / 1000); lastTradeMs = t.T; }
-      else k.forEach(x => applyBar(x));
+      if (isSecTf()) {
+        if (k.length) applyTrades(k);            // batché par seau (pas 1000 updates LWC)
+        if (k.length === 1000) fillGapSecSoon(); // page pleine = retard : on draine sans attendre le tick suivant
+      }
+      else k.slice(-2).forEach(x => applyBar(x));  // seau le plus ancien du rollup potentiellement partiel : écarté
     } catch { backoff = 5; failed(); }
     finally { inFlight = false; }
   }, 2000);
@@ -896,7 +998,10 @@ function startWs(attempt = 0) {
       if (replay || !candles.length) return;
       if (stream.endsWith('aggTrade')) {
         const p = +d.p, tt = d.T / 1000, last = candles[candles.length - 1];
-        if (isSecTf()) { applyTrade(p, +d.q, tt); lastTradeMs = d.T; }
+        if (isSecTf()) {
+          if (lastAggId && d.a > lastAggId + 1) fillGapSecSoon();   // trou d'ids (retour de cache…) : rattrapage ORDONNÉ, sans double-compte
+          else { applyTrade(p, +d.q, tt); lastTradeMs = d.T; lastAggId = d.a; }
+        }
         // borne haute : un trade de la bougie SUIVANTE ne doit jamais réécrire la bougie clôturée
         else if (tt >= last.time && tt < barEnd(last.time)) {
           last.close = p;
@@ -914,8 +1019,8 @@ function startWs(attempt = 0) {
           const bt = bucketStart(sb.time), last = candles[candles.length - 1];
           if (!last) return;
           if (bt > last.time) {
-            bucketVols = new Map([[sb.time, sb.volume]]);
             applyBar({ time: bt, open: sb.open, high: sb.high, low: sb.low, close: sb.close, volume: sb.volume });
+            bucketVols = new Map([[sb.time, sb.volume]]);   // APRÈS applyBar (qui purge le seau précédent)
           } else if (bt === last.time) {
             /* volume du seau = somme des bougies source connues ; léger sous-comptage possible
                juste après un load mi-seau (corrigé par le prochain poll/fillGap) */
@@ -970,6 +1075,7 @@ TFS.forEach(t => {
     if (replay) exitReplay(false);
     // rester où on regarde ; si un backfill est déjà en cours, on garde sa CIBLE (la vue transitoire mentirait)
     try { keepRange = keepRange ?? ts().getVisibleRange(); } catch { keepRange = null; }
+    cacheBars();   // le TF quitté restera INSTANTANÉ au retour
     tf = t;
     lsSet('orion-tf', tf);
     document.querySelectorAll('.tfbtn').forEach(x => x.classList.toggle('on', x === b));
@@ -993,6 +1099,7 @@ async function setSymbol(v) {
   } catch { if (req === symSeq) toast('Réseau : symbole non vérifié, réessaie'); return; }
   if (replay) exitReplay(false);
   keepRange = null;   // un changement de symbole ne consomme pas la fenêtre d'un TF raté
+  cacheBars();        // le contexte quitté restera instantané au retour
   symbol = v;
   lsSet('orion-sym', symbol);
   $('symBtn').textContent = v + ' ▾';
@@ -1179,7 +1286,7 @@ function clearDrawings() { drawings = []; resetTransient(); saveDrawings(); }
 function lOf(t) {            // temps unix → index logique (extrapole hors données)
   const a = dataNow();
   if (!a.length || t == null) return null;
-  const sec = TFSEC[tf] || 60;
+  const sec = tfDef().sec;
   if (t <= a[0].time) return (t - a[0].time) / sec;
   if (t >= a[a.length - 1].time) return a.length - 1 + (t - a[a.length - 1].time) / sec;
   let lo = 0, hi = a.length - 1;
@@ -1189,7 +1296,7 @@ function lOf(t) {            // temps unix → index logique (extrapole hors don
 function tOf(l) {            // index logique → temps unix
   const a = dataNow();
   if (!a.length || l == null) return null;
-  const sec = TFSEC[tf] || 60;
+  const sec = tfDef().sec;
   const i = Math.floor(l);
   if (i < 0) return a[0].time + l * sec;
   if (i >= a.length - 1) return a[a.length - 1].time + (l - (a.length - 1)) * sec;
@@ -1208,7 +1315,8 @@ function saveDrawings() {
    ancien schéma) ne doit jamais atteindre drawOne/hitTest — sinon exception dans le rAF */
 const numOk = v => typeof v === 'number' && isFinite(v);
 const ptOk = p => p && numOk(p.t) && numOk(p.price);
-const tfOk = t => typeof t === 'string' && Object.hasOwn(TFSEC, t);   // TF de zone = 1m → 1M, aligné sur propTf
+const TFK_LEGACY = ['6h', '12h', '3d'];   // clés retirées de la liste — les zones qui les portent SURVIVENT (zLabel les rend : H6, H12, D3)
+const tfOk = t => typeof t === 'string' && (Object.hasOwn(TFSEC, t) || TFK_LEGACY.includes(t));
 /* nomenclature zones (préfixe, style doctrine) : s3…s45, m1…m30, H1…H8, D1, D2, W1, W2, M1…M4 */
 const zLabel = t => (t.endsWith('s') ? 's' : t.endsWith('m') ? 'm' : t.slice(-1).toUpperCase()) + t.slice(0, -1);
 function drawingOk(d) {
@@ -1657,7 +1765,7 @@ function futureHidden(d) {
   let mt = minTCache.get(d);
   if (mt === undefined) minTCache.set(d, mt = anchorTs(d, Math.min) ?? null);   // undefined = absent, null = sans ancre
   // tolérance quart de bougie : l'arrondi flottant du clamp de drag peut poser une ancre 1 ulp au-delà de la tête
-  return mt != null && mt > head.time + (TFSEC[tf] || 60) / 4;
+  return mt != null && mt > head.time + tfDef().sec / 4;
 }
 function hitTest(mx, my) {
   const TH = 6;
@@ -2136,7 +2244,7 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
     if (isSecTf()) {                             // secondes : pagination arrière des trades, à la demande du scroll
       older = await fetchOlderSec();
       if (replay) return;
-      if (older === 'end') { oldestDone = true; return; }
+      if (older === OLDEST) { oldestDone = true; return; }
       if (older == null) return;                 // erreur/contexte : on retentera au prochain scroll
       const head = candles[0], lastNew = older[older.length - 1];
       if (lastNew && head && lastNew.time === head.time) {   // fusion du seau frontière (trades du même seau)
@@ -2148,7 +2256,7 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
       }
       if (!older.length) return;
     } else {
-      older = await fetchOlder(1500);            // max Binance : 3× moins de reconstructions qu'à 500
+      older = await fetchOlder(KL_PAGE);         // page à poids réduit (5 vs 10) — 2× moins cher par bougie
       if (replay) return;                        // supplanté pendant le fetch
       if (older === FETCH_ERR) { oldErrUntil = Date.now() + 30000; return; } // erreur API/réseau : pause 30 s
       if (older == null) return;                 // contexte périmé (seq/tête) → réponse jetée
@@ -2162,7 +2270,8 @@ ts().subscribeVisibleLogicalRangeChange(async r => {
     if (!older.length) { oldestDone = true; return; }
     candles = older.concat(candles);
     setAllDeferInd(candles);
-    if (!isSecTf() && older.length < 1500) oldestDone = true;
+    // page « pleine » d'un TF agrégé = KL_PAGE/fact seaux (moins le partiel écarté)
+    if (!isSecTf() && older.length < Math.floor(KL_PAGE / (tfDef().fact || 1)) - 1) oldestDone = true;
   } catch {} finally { loadingOld = false; }
 });
 
