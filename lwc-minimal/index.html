@@ -660,30 +660,25 @@ async function load(keepZoom = false, attempt = 0) {
     candles = k.map(mapK);
     dataCtx = symbol + '|' + tf;
     setPrecision(candles.at(-1).close);
-    setAll(candles);
     if (keepRange && keepRange.from != null) {
-      /* changement de TF : on reste sur la MÊME fenêtre temporelle (comme TV) ;
-         backfill borné si le nouveau TF ne couvre pas encore la zone regardée */
+      /* changement de TF : on reste sur la MÊME fenêtre temporelle (comme TV).
+         Le backfill se fait AVANT tout affichage : l'ancien TF reste à l'écran
+         (curseur busy) et le nouveau apparaît DÉJÀ cadré — une seule transition,
+         aucune saccade, aucune popup (demande Meddy). */
       const target = keepRange.from, targetTo = keepRange.to;
-      const applyRange = () => {   // clampé aux données disponibles
-        const from = Math.max(target, candles[0].time);
-        const to = Math.min(targetTo, candles[candles.length - 1].time + (TFSEC[tf] || 60) * 6);
-        if (to > from) ts().setVisibleRange({ from, to }); else snapToLive();
-      };
-      applyRange();   // positionnement PROVISOIRE immédiat : pas de fenêtre arbitraire pendant le backfill
-      let grew = false;
       for (let g = 0; candles[0].time > target && candles.length < MAX_BARS && g < 8; g++) {
-        if (g === 0) toast('Chargement de l’historique du nouveau TF…');
         const older = await fetchOlder(1500);
         if (seq !== loadSeq || replay) return;
         if (!Array.isArray(older) || !older.length) break;
-        candles = older.concat(candles); grew = true;
+        candles = older.concat(candles);
       }
-      if (grew) setAll(candles);
-      if (candles[0].time > target) toast('Historique insuffisant sur ce TF pour couvrir toute la zone');
       keepRange = null;
-      applyRange();
+      setAll(candles);
+      const from = Math.max(target, candles[0].time);   // clampé en silence si l'historique ne couvre pas tout
+      const to = Math.min(targetTo, candles[candles.length - 1].time + (TFSEC[tf] || 60) * 6);
+      if (to > from) ts().setVisibleRange({ from, to }); else snapToLive();
     } else {
+      setAll(candles);
       if (!keepZoom) ts().resetTimeScale();
       snapToLive();
     }
