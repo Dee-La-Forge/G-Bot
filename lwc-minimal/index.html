@@ -316,6 +316,9 @@
         <option value="acc">Accélération</option>
         <option value="sd">S/D</option>
       </select>
+      <select id="propTf" title="TF de la zone" hidden>
+        <option value="">TF</option>
+      </select>
       <span id="swatches"></span>
       <input type="color" id="propColor" title="Couleur personnalisée">
       <div class="pdiv"></div>
@@ -949,6 +952,7 @@ let defaultStyle = { color: '#d9b64d', width: 1.5, dash: 'solid' };
 const RKINDS = { ob: { label: 'OB', color: '#f0d478' }, acc: { label: 'ACC', color: '#f2984d' }, sd: { label: 'S/D', color: '#4d8fe0' } };
 let rectKind = '';        // type appliqué aux prochains rectangles tracés
 let rectColor = null;     // couleur explicitement choisie par l'utilisateur pour les rects typés (sinon préréglage)
+let rectTf = '';          // TF de zone appliqué aux prochains rectangles (3m → 1M)
 let drawings = [], temp = null, measure = null;
 let sel = null, drag = null, editIdx = null;
 
@@ -994,6 +998,7 @@ function drawingOk(d) {
   if (d.color != null && !(typeof d.color === 'string' && /^#[0-9a-f]{6}$/i.test(d.color))) return false;
   if (d.width != null && !numOk(d.width)) return false;
   if (d.kind != null && !Object.hasOwn(RKINDS, d.kind)) return false;   // pas de clé héritée (__proto__, toString…)
+  if (d.tfk != null && !(typeof d.tfk === 'string' && Object.hasOwn(TFSEC, d.tfk))) return false;
   switch (d.type) {
     case 'hline':   return numOk(d.price);
     case 'vline':   return numOk(d.t);
@@ -1191,8 +1196,25 @@ function syncPropbar() {
   $('propStyle').value = st.dash || 'solid';
   const rectCtx = sel != null && drawings[sel] ? drawings[sel].type === 'rect' : tool === 'rect';
   $('propKind').hidden = !rectCtx;
-  if (rectCtx) $('propKind').value = sel != null && drawings[sel] ? (drawings[sel].kind || '') : rectKind;
+  $('propTf').hidden = !rectCtx;
+  if (rectCtx) {
+    $('propKind').value = sel != null && drawings[sel] ? (drawings[sel].kind || '') : rectKind;
+    $('propTf').value = sel != null && drawings[sel] ? (drawings[sel].tfk || '') : rectTf;
+  }
 }
+TFS.slice(1).forEach(t => {   // 3m → 1M (le 1m n'est pas un TF de zone)
+  const o = document.createElement('option');
+  o.value = t; o.textContent = tfLabel(t);
+  $('propTf').appendChild(o);
+});
+$('propTf').addEventListener('change', e => {
+  const v = e.target.value;
+  if (sel != null && drawings[sel] && drawings[sel].type === 'rect') {
+    if (v) drawings[sel].tfk = v; else delete drawings[sel].tfk;
+    saveDrawings();
+  } else rectTf = v;
+  syncPropbar();
+});
 $('propKind').addEventListener('change', e => {
   const v = e.target.value;
   if (sel != null && drawings[sel] && drawings[sel].type === 'rect') {
@@ -1285,6 +1307,7 @@ wrap.addEventListener('mousedown', e => {
   if (AB_TYPES.includes(tool)) {
     temp = { type: tool, a: p, b: p, ...st };
     if (tool === 'rect' && rectKind) { temp.kind = rectKind; temp.color = rectColor ?? RKINDS[rectKind].color; }
+    if (tool === 'rect' && rectTf) temp.tfk = rectTf;
   }
 }, true);
 document.addEventListener('mousemove', e => {
@@ -1669,14 +1692,15 @@ function drawOne(d, isSel) {
         ctx.stroke();
         ctx.shadowBlur = 0;
         const k = RKINDS[d.kind];
-        if (k && w > 34 && h > 16) {   // label centré, taille dynamique
+        const lbl = (k ? k.label : '') + (d.tfk ? (k ? ' · ' : '') + tfLabel(d.tfk) : '');
+        if (lbl && w > 34 && h > 16) {   // label centré, taille dynamique
           const fs = Math.max(9, Math.min(24, h * .24, w * .14));
           ctx.fillStyle = hexToRgba(col, .92);
           ctx.font = `600 ${fs.toFixed(1)}px Bahnschrift, 'Segoe UI', sans-serif`;
           ctx.letterSpacing = (fs * .22).toFixed(1) + 'px';
           ctx.shadowColor = col; ctx.shadowBlur = hudGlow ? fs * .45 : 0;
           ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-          ctx.fillText(k.label, xa + w / 2, ya + h / 2);
+          ctx.fillText(lbl, xa + w / 2, ya + h / 2);
           ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
           ctx.shadowBlur = 0; ctx.letterSpacing = '0px';
         }
