@@ -320,7 +320,7 @@
     // retrouve sa position G-Bot d'origine quand le sonar est masque
     const wm = document.getElementById("watermark");
     if (wm) {
-      wm.style.left = visible ? "calc(10% + 30px)" : "";
+      wm.style.left = visible ? "calc(5% + 30px)" : "";
       wm.style.top = visible ? "111px" : "";
       wm.style.bottom = visible ? "auto" : "";
     }
@@ -351,9 +351,9 @@
       #gonWhaleCv { position:absolute; inset:0; pointer-events:none; z-index:6; }
       /* Radar autonome en HAUT A GAUCHE, sous la legende ATR ; le journal
          forme une colonne cockpit juste en dessous. Le logo reste intact. */
-      #gonWhaleRadar { position:absolute; left:10%; top:81px; width:144px; height:144px;
+      #gonWhaleRadar { position:absolute; left:5%; top:81px; width:144px; height:144px;
         pointer-events:auto; cursor:pointer; z-index:7; }
-      #gonWhaleLog { position:absolute; left:calc(10% + 7px); top:232px; width:200px; z-index:7;
+      #gonWhaleLog { position:absolute; left:calc(5% + 7px); top:232px; width:200px; z-index:7;
         pointer-events:none; font:11px "Segoe UI", sans-serif; }
       .gonWhEv { display:flex; align-items:center; gap:6px; padding:2px 0; color:#c9c4b4; }
       .gonWhEv i { width:5px; height:5px; border-radius:50%; flex:none; }
