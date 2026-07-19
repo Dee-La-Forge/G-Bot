@@ -167,10 +167,10 @@
 
   function addBlip(side, usd, dim) {
     if (!shown()) return;
-    // tout l'interieur du disque est disponible (radar autonome, sans logo)
+    // orbite 44-58 : hors du logo (42), sous l'anneau externe (60)
     blips.push({ side, dim, born: performance.now(),
       r: dim ? 1.6 : Math.min(6, 2 + Math.log10(Math.max(1, usd / 1e5)) * 2.2),
-      ang: Math.random() * Math.PI * 2, dist: 12 + Math.random() * 44 });
+      ang: Math.random() * Math.PI * 2, dist: 44 + Math.random() * 14 });
     if (blips.length > 90) blips.shift();
   }
 
@@ -239,16 +239,17 @@
     }
   }
 
-  // Radar autonome 130x130 : centre (65,65), anneaux de portee internes.
+  // 130x130 centre (65,65) — le watermark G-Bot est deplace sous le radar
+  // (applyVisible) : anneaux HORS du logo (rayon 42), il est le coeur.
   const RC_X = 65, RC_Y = 65, R_MAX = 60;
   function drawRadar(now) {
     radarCx.setTransform(2, 0, 0, 2, 0, 0);
     radarCx.clearRect(0, 0, 130, 130);
     const cxr = RC_X, cyr = RC_Y;
-    radarCx.strokeStyle = "rgba(217,182,77,.28)"; radarCx.lineWidth = 1;
-    radarCx.beginPath(); radarCx.arc(cxr, cyr, R_MAX, 0, Math.PI * 2); radarCx.stroke();
-    radarCx.strokeStyle = "rgba(217,182,77,.14)";
-    for (const rr of [24, 44]) {
+    radarCx.strokeStyle = "rgba(217,182,77,.34)"; radarCx.lineWidth = 1;
+    radarCx.beginPath(); radarCx.arc(cxr, cyr, 43, 0, Math.PI * 2); radarCx.stroke();
+    radarCx.strokeStyle = "rgba(217,182,77,.16)";
+    for (const rr of [52, R_MAX]) {
       radarCx.beginPath(); radarCx.arc(cxr, cyr, rr, 0, Math.PI * 2); radarCx.stroke();
     }
     sweepA += 0.014;
@@ -315,6 +316,14 @@
     cv.style.display = visible ? "block" : "none";
     radarCv.style.display = visible ? "block" : "none";
     journalEl.style.display = visible ? "block" : "none";
+    // le logo vient se placer SOUS le radar (centre commun 77,169) et
+    // retrouve sa position G-Bot d'origine quand le sonar est masque
+    const wm = document.getElementById("watermark");
+    if (wm) {
+      wm.style.left = visible ? "35px" : "";
+      wm.style.top = visible ? "127px" : "";
+      wm.style.bottom = visible ? "auto" : "";
+    }
     btn.classList.toggle("on", visible);
     if (!visible) { if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
       waves.length = 0; scars.length = 0; surges.length = 0; blips.length = 0; }
