@@ -289,11 +289,11 @@
          pleine largeur, sans marge — epouse les angles bas du panneau.
          Le panneau vit A COTE du chart (colonne flex) : pointer-events:auto
          est sans danger et rend le survol video/volume fonctionnel. */
-      #gonLiqVideo { position:relative; margin-top:auto; }
-      /* ecran agrandi : hauteur fixe + cover (recadre les bords au lieu
-         d'ecraser l'image — la largeur du panneau ne bouge pas) */
-      #gonLiqVideo video { display:block; width:100%; height:187px; object-fit:cover;
-        border-radius:0 0 5px 5px; }
+      /* ecran agrandi : le CONTENEUR porte la hauteur (item flex fixe,
+         non compressible) et la video remplit son cadre en cover */
+      #gonLiqVideo { position:relative; margin-top:auto; flex:0 0 187px; height:187px;
+        overflow:hidden; border-radius:0 0 5px 5px; }
+      #gonLiqVideo video { display:block; width:100%; height:100%; object-fit:cover; }
       #gonLiqSnd { position:absolute; right:6px; bottom:8px; pointer-events:auto;
         background:rgba(10,10,8,.72); border:1px solid rgba(217,182,77,.3);
         color:#d9b64d; border-radius:3px; font:12px Consolas,monospace;
