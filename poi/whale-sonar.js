@@ -365,7 +365,7 @@
         pointer-events:none; font:11px "Segoe UI", sans-serif; }
       .gonWhEv { display:flex; align-items:center; gap:6px; padding:2px 0; color:#c9c4b4; }
       .gonWhEv i { width:5px; height:5px; border-radius:50%; flex:none; }
-      #gonWhaleBtn { background:none; border:1px solid #232635; color:#c9c4b4;
+      #gonWhaleBtn { background:none; border:1px solid #232635; color:#d9b64d;
         font-size:13px; line-height:1; padding:2px 7px; cursor:pointer; opacity:.5; }
       #gonWhaleBtn:hover { border-color:#d9b64d; }
       #gonWhaleBtn.on { opacity:1; text-shadow:0 0 8px rgba(217,182,77,.6); }
@@ -390,7 +390,7 @@
     document.addEventListener("pointerdown", armAudio, { once: true });
 
     btn = document.createElement("button");
-    btn.id = "gonWhaleBtn"; btn.title = "Sonar baleines"; btn.textContent = "◎";
+    btn.id = "gonWhaleBtn"; btn.title = "Sonar baleines"; btn.textContent = "◎︎";
     const host = document.getElementById("gonPoiCtl") || document.getElementById("topbar");
     if (host) host.appendChild(btn);
     try { visible = localStorage.getItem(ON_KEY) !== "0"; } catch (_) {}
