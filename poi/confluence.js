@@ -30,26 +30,51 @@
   let visible = true, curSymbol = "", rafId = 0;
   let ws = null, attempt = 0, lastMsgAt = 0, reconnectTimer = 0;
 
-  /* ---------- profil + CVD : reconstruits des KLINES 48 h (192 x 15m).
-   * Le CVD est EXACT (takerBuyVolume = volume agresseur acheteur reel) ;
-   * le profil est une approximation par bougie (volume distribue sur le
-   * range) — disponible DES LE CHARGEMENT, la ou l'accumulateur footprint
-   * n'a que la session courante. Rafraichi toutes les 60 s (poids 10). */
+  /* ---------- profil + CVD : reconstruits des klines sur la FENETRE VISIBLE
+   * de la chart (comme un VPVR) — l'intervalle s'adapte au zoom pour rester
+   * sous ~700 bougies. CVD EXACT (2*takerBuy - volume, volume agresseur reel) ;
+   * profil = volume distribue sur le range de chaque bougie. Refetch quand la
+   * fenetre visible bouge de >25 % (mini 8 s entre appels) ou toutes les 60 s. */
   let profile = new Map(), profMax = 0, pocBin = null, cvdPts = [], binSize = 10;
-  let lastKlinesAt = 0, klinesBusy = false;
-  async function rebuildFromKlines() {
-    if (klinesBusy || Date.now() - lastKlinesAt < 55000) return;
-    klinesBusy = true;
-    const sym = curSymbol, mySeq = sym;
+  let lastKlinesAt = 0, klinesBusy = false, lastFetchRange = null;
+  function pickInterval(spanSec) {
+    for (const [iv, sec] of [["5m", 300], ["15m", 900], ["1h", 3600], ["4h", 14400], ["1d", 86400]]) {
+      if (spanSec / sec <= 700) return [iv, sec];
+    }
+    return ["1d", 86400];
+  }
+  function visibleRange() {
     try {
-      const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=15m&limit=192`);
+      const vr = gon.ts && gon.ts.getVisibleRange ? gon.ts.getVisibleRange() : null;
+      if (vr && Number.isFinite(+vr.from) && Number.isFinite(+vr.to)) return { from: +vr.from, to: +vr.to };
+    } catch (_) {}
+    const now = Math.floor(Date.now() / 1000);
+    return { from: now - 48 * 3600, to: now };
+  }
+  async function rebuildFromKlines() {
+    if (klinesBusy) return;
+    const now = Date.now();
+    const vr = visibleRange();
+    let from = Math.floor(vr.from), to = Math.min(Math.ceil(vr.to), Math.floor(now / 1000) + 900);
+    if (to - from < 3600) from = to - 3600;
+    const span = to - from;
+    if (lastFetchRange && now - lastKlinesAt < 55000 &&
+        Math.abs(from - lastFetchRange.from) < span * 0.25 &&
+        Math.abs(to - lastFetchRange.to) < span * 0.25) return;
+    if (now - lastKlinesAt < 8000) return;       // cadence dure pendant un pan
+    klinesBusy = true;
+    const sym = curSymbol;
+    try {
+      const [iv] = pickInterval(span);
+      const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=${iv}` +
+        `&startTime=${from * 1000}&endTime=${to * 1000}&limit=1000`);
       if (!r.ok) return;
       const rows = await r.json();
-      if (curSymbol !== mySeq || !Array.isArray(rows) || rows.length < 2) return;
-      lastKlinesAt = Date.now();
+      if (curSymbol !== sym || !Array.isArray(rows) || rows.length < 2) return;
+      lastKlinesAt = Date.now(); lastFetchRange = { from, to };
       let lo = Infinity, hi = -Infinity;
       for (const k of rows) { lo = Math.min(lo, +k[3]); hi = Math.max(hi, +k[2]); }
-      // bin d'AFFICHAGE : ~90 lignes sur le range 48 h (independant du moteur)
+      // bin d'AFFICHAGE : ~90 lignes sur le range visible
       const raw = (hi - lo) / 90;
       const mag = Math.pow(10, Math.floor(Math.log10(raw)));
       binSize = Math.max(mag, Math.round(raw / mag) * mag);
@@ -283,7 +308,7 @@
     if (gon.symbol && gon.symbol !== curSymbol) {
       curSymbol = gon.symbol;
       walls = new Map(); ghosts = []; profile = new Map(); cvdPts = [];
-      lastKlinesAt = 0;
+      lastKlinesAt = 0; lastFetchRange = null;
       if (ws) { ws.onclose = null; try { ws.close(); } catch (_) {} ws = null; }
       connect();
       rebuildFromKlines();
