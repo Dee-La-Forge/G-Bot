@@ -45,7 +45,9 @@
   }
   function visibleRange() {
     try {
-      const vr = gon.ts && gon.ts.getVisibleRange ? gon.ts.getVisibleRange() : null;
+      // gon.ts est une FONCTION dans le seam G-Bot : () => chart.timeScale()
+      const t = typeof gon.ts === "function" ? gon.ts() : gon.ts;
+      const vr = t && t.getVisibleRange ? t.getVisibleRange() : null;
       if (vr && Number.isFinite(+vr.from) && Number.isFinite(+vr.to)) return { from: +vr.from, to: +vr.to };
     } catch (_) {}
     const now = Math.floor(Date.now() / 1000);
