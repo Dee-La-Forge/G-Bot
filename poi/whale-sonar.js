@@ -167,9 +167,10 @@
 
   function addBlip(side, usd, dim) {
     if (!shown()) return;
+    // orbite dans la bande 45-63 : hors du logo, sous l'anneau externe
     blips.push({ side, dim, born: performance.now(),
       r: dim ? 1.6 : Math.min(6, 2 + Math.log10(Math.max(1, usd / 1e5)) * 2.2),
-      ang: Math.random() * Math.PI * 2, dist: 22 + Math.random() * 40 });
+      ang: Math.random() * Math.PI * 2, dist: 45 + Math.random() * 18 });
     if (blips.length > 90) blips.shift();
   }
 
@@ -242,8 +243,11 @@
     radarCx.setTransform(2, 0, 0, 2, 0, 0);
     radarCx.clearRect(0, 0, 140, 140);
     const c = 70;
-    radarCx.strokeStyle = "rgba(217,182,77,.18)"; radarCx.lineWidth = 1;
-    for (const rr of [28, 50, 66]) {
+    // anneaux HORS du logo (rayon 42) : le logo est le coeur de l'instrument
+    radarCx.strokeStyle = "rgba(217,182,77,.34)"; radarCx.lineWidth = 1;
+    radarCx.beginPath(); radarCx.arc(c, c, 43, 0, Math.PI * 2); radarCx.stroke();
+    radarCx.strokeStyle = "rgba(217,182,77,.16)";
+    for (const rr of [55, 66]) {
       radarCx.beginPath(); radarCx.arc(c, c, rr, 0, Math.PI * 2); radarCx.stroke();
     }
     sweepA += 0.014;
@@ -310,6 +314,10 @@
     cv.style.display = visible ? "block" : "none";
     radarCv.style.display = visible ? "block" : "none";
     journalEl.style.display = visible ? "block" : "none";
+    // aligne le centre du watermark G-Bot sur le centre du radar (76,78) —
+    // decale de 24px seulement, et restaure sa position d'origine si masque
+    const wm = document.getElementById("watermark");
+    if (wm) wm.style.left = visible ? "34px" : "";
     btn.classList.toggle("on", visible);
     if (!visible) { if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
       waves.length = 0; scars.length = 0; surges.length = 0; blips.length = 0; }
@@ -335,9 +343,12 @@
     const css = document.createElement("style");
     css.textContent = `
       #gonWhaleCv { position:absolute; inset:0; pointer-events:none; z-index:6; }
-      #gonWhaleRadar { position:absolute; left:20px; bottom:46px; width:140px; height:140px;
+      /* FUSION logo/radar : le canvas est centre EXACTEMENT sur le cercle du
+         watermark G-Bot (deux cercles, un seul instrument) — anneaux et blips
+         orbitent autour de l'embleme, le balayage scanne sa surface. */
+      #gonWhaleRadar { position:absolute; left:6px; bottom:8px; width:140px; height:140px;
         pointer-events:auto; cursor:pointer; z-index:7; }
-      #gonWhaleLog { position:absolute; left:172px; bottom:50px; width:200px; z-index:7;
+      #gonWhaleLog { position:absolute; left:158px; bottom:44px; width:200px; z-index:7;
         pointer-events:none; font:11px "Segoe UI", sans-serif; }
       .gonWhEv { display:flex; align-items:center; gap:6px; padding:2px 0; color:#c9c4b4; }
       .gonWhEv i { width:5px; height:5px; border-radius:50%; flex:none; }
