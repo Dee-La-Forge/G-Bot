@@ -787,6 +787,9 @@
     }
     window.__gonPoi = {
       pois: () => pois, provisional: () => poiProvisional, restart: startPoiStream, render,
+      // Lecture seule pour les modules de confluence (profil/CVD) : bins et
+      // deltas des buckets footprint + config (binSize) du symbole courant.
+      accumulator: () => poiAccumulator, config: () => poiConfig,
       // Sonde diagnostique du provisoire (lecture seule)
       provDiag: () => ({
         seedTs: poiProvisionalSeedTs ? new Date(poiProvisionalSeedTs).toISOString().slice(11, 16) : null,
