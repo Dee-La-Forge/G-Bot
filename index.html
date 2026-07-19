@@ -624,7 +624,6 @@ const volSeries = chart.addSeries(LWC.HistogramSeries, {
   priceScaleId: '', priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false,
 });
 volSeries.priceScale().applyOptions({ scaleMargins: { top: .85, bottom: 0 } });
-volSeries.applyOptions({ visible: false });   // histogramme volume masqué : seule la courbe ATR occupe la zone basse
 
 /* ---------- indicateur : ATR 233 lissé SMA (zone volume) ---------- */
 const IND_N = 233;
@@ -633,6 +632,7 @@ const atrSeries = chart.addSeries(LWC.LineSeries, {
   priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
 });
 atrSeries.priceScale().applyOptions({ scaleMargins: { top: .93, bottom: .01 } });
+atrSeries.applyOptions({ visible: false });   // courbe ATR masquée (le calcul et la légende restent actifs)
 let lastAtr = null, indTrs = [], indSum = 0, indStale = false, indTimer = null, indSince = 0;
 const IND_MAX_STALE = 1000;   // fenêtre max sans recalcul ATR (scroll continu / onglet throttlé) — source unique
 const indOverdue = () => Date.now() - indSince > IND_MAX_STALE;
