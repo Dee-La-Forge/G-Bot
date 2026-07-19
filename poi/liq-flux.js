@@ -239,7 +239,7 @@
          le ResizeObserver de G-Bot redimensionne le chart tout seul. */
       /* boite alignee sur le haut du chart ; le rythme interieur d'origine
          est conserve via un padding-top equivalent a l'ancienne marge */
-      #gonLiqPanel { flex:0 0 160px; position:relative; margin:0 8px 8px 0; padding-top:8px;
+      #gonLiqPanel { flex:0 0 280px; position:relative; margin:0 8px 8px 0; padding-top:8px;
         display:flex; flex-direction:column; pointer-events:auto;
         background:rgba(10,10,8,.85);
         border:1px solid rgba(217,182,77,.14); border-radius:6px;
@@ -289,9 +289,9 @@
          pleine largeur, sans marge — epouse les angles bas du panneau.
          Le panneau vit A COTE du chart (colonne flex) : pointer-events:auto
          est sans danger et rend le survol video/volume fonctionnel. */
-      /* ecran agrandi : le CONTENEUR porte la hauteur (item flex fixe,
-         non compressible) et la video remplit son cadre en cover */
-      #gonLiqVideo { position:relative; margin-top:auto; flex:0 0 187px; height:187px;
+      /* ecran au VRAI ratio de la video (640x360 = 16:9) sur toute la
+         largeur du panneau : image complete, aucun recadrage */
+      #gonLiqVideo { position:relative; margin-top:auto; flex:0 0 auto; aspect-ratio:16/9;
         overflow:hidden; border-radius:0 0 5px 5px; }
       #gonLiqVideo video { display:block; width:100%; height:100%; object-fit:cover; }
       #gonLiqSnd { position:absolute; right:6px; bottom:8px; pointer-events:auto;
