@@ -167,10 +167,10 @@
 
   function addBlip(side, usd, dim) {
     if (!shown()) return;
-    // orbite dans la bande 44-58 : hors du logo, sous l'anneau externe (60)
+    // tout l'interieur du disque est disponible (radar autonome, sans logo)
     blips.push({ side, dim, born: performance.now(),
       r: dim ? 1.6 : Math.min(6, 2 + Math.log10(Math.max(1, usd / 1e5)) * 2.2),
-      ang: Math.random() * Math.PI * 2, dist: 44 + Math.random() * 14 });
+      ang: Math.random() * Math.PI * 2, dist: 12 + Math.random() * 44 });
     if (blips.length > 90) blips.shift();
   }
 
@@ -239,19 +239,16 @@
     }
   }
 
-  // Centre du dessin = centre du watermark G-Bot (left 10 + 42, bottom 36 + 42)
-  // dans un canvas 160x160 cale en bas-gauche : (52, 160-78). Le logo ne bouge
-  // JAMAIS — le radar est un pur overlay dessus.
-  const RC_X = 52, RC_Y = 82, R_EDGE = 43, R_MAX = 60;
+  // Radar autonome 130x130 : centre (65,65), anneaux de portee internes.
+  const RC_X = 65, RC_Y = 65, R_MAX = 60;
   function drawRadar(now) {
     radarCx.setTransform(2, 0, 0, 2, 0, 0);
-    radarCx.clearRect(0, 0, 160, 160);
+    radarCx.clearRect(0, 0, 130, 130);
     const cxr = RC_X, cyr = RC_Y;
-    // anneaux HORS du logo (rayon 42) : le logo est le coeur de l'instrument
-    radarCx.strokeStyle = "rgba(217,182,77,.34)"; radarCx.lineWidth = 1;
-    radarCx.beginPath(); radarCx.arc(cxr, cyr, R_EDGE, 0, Math.PI * 2); radarCx.stroke();
-    radarCx.strokeStyle = "rgba(217,182,77,.16)";
-    for (const rr of [52, R_MAX]) {
+    radarCx.strokeStyle = "rgba(217,182,77,.28)"; radarCx.lineWidth = 1;
+    radarCx.beginPath(); radarCx.arc(cxr, cyr, R_MAX, 0, Math.PI * 2); radarCx.stroke();
+    radarCx.strokeStyle = "rgba(217,182,77,.14)";
+    for (const rr of [24, 44]) {
       radarCx.beginPath(); radarCx.arc(cxr, cyr, rr, 0, Math.PI * 2); radarCx.stroke();
     }
     sweepA += 0.014;
@@ -279,7 +276,7 @@
     radarCx.restore();
     radarCx.fillStyle = muted ? "rgba(110,106,88,.9)" : "rgba(217,182,77,.9)";
     radarCx.font = "9px Segoe UI";
-    radarCx.fillText(muted ? "♪ off" : "♪", 4, 154);
+    radarCx.fillText(muted ? "♪ off" : "♪", 4, 126);
   }
 
   /* ---------- son ---------- */
@@ -343,12 +340,11 @@
     const css = document.createElement("style");
     css.textContent = `
       #gonWhaleCv { position:absolute; inset:0; pointer-events:none; z-index:6; }
-      /* Radar en OVERLAY sur le watermark G-Bot, qui ne bouge PAS : le canvas
-         couvre le coin bas-gauche et dessine ses anneaux centres sur le logo
-         (centre 52,78) — l'anneau externe se coupe naturellement au bord. */
-      #gonWhaleRadar { position:absolute; left:0; bottom:0; width:160px; height:160px;
+      /* Radar autonome en HAUT A GAUCHE, sous la legende ATR ; le journal
+         forme une colonne cockpit juste en dessous. Le logo reste intact. */
+      #gonWhaleRadar { position:absolute; left:12px; top:104px; width:130px; height:130px;
         pointer-events:auto; cursor:pointer; z-index:7; }
-      #gonWhaleLog { position:absolute; left:170px; bottom:44px; width:200px; z-index:7;
+      #gonWhaleLog { position:absolute; left:12px; top:240px; width:200px; z-index:7;
         pointer-events:none; font:11px "Segoe UI", sans-serif; }
       .gonWhEv { display:flex; align-items:center; gap:6px; padding:2px 0; color:#c9c4b4; }
       .gonWhEv i { width:5px; height:5px; border-radius:50%; flex:none; }
@@ -363,7 +359,7 @@
     cv = document.createElement("canvas"); cv.id = "gonWhaleCv";
     cx = cv.getContext("2d");
     radarCv = document.createElement("canvas"); radarCv.id = "gonWhaleRadar";
-    radarCv.width = 320; radarCv.height = 320;
+    radarCv.width = 260; radarCv.height = 260;
     radarCx = radarCv.getContext("2d");
     journalEl = document.createElement("div"); journalEl.id = "gonWhaleLog";
     gon.mount.appendChild(cv); gon.mount.appendChild(radarCv); gon.mount.appendChild(journalEl);
