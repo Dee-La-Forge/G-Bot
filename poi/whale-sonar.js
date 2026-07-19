@@ -84,6 +84,11 @@
     if (isCur) {
       addBlip(side, n, false);
       journal(side, n, sym, false);
+      // MINI-ECHO : print isole >= P99.99 (~1/h) — petit anneau discret sur
+      // la bougie, sans sillage, sans embrasement, sans ping. La pleine onde
+      // de choc reste reservee aux bursts.
+      if (n >= st.thrHi && shown())
+        waves.push({ tSec: T / 1000, price, side, born: performance.now(), mini: true });
     } else if (now - lastDimBlipAt > 400) {
       lastDimBlipAt = now; addBlip(side, n, true);
     }
@@ -190,22 +195,25 @@
 
   function drawWaves(now, w, plotW) {
     for (let i = waves.length - 1; i >= 0; i--) {
-      const wv = waves[i], a = (now - wv.born) / 1900;
+      const wv = waves[i], a = (now - wv.born) / (wv.mini ? 1200 : 1900);
       if (a >= 1) { waves.splice(i, 1); continue; }
       let x = gon.timeToX(wv.tSec); const y = gon.priceToY(wv.price);
       if (y == null || !isFinite(y)) continue;
       if (x == null || !isFinite(x) || x > plotW) x = plotW - 60;
-      const r = 14 + a * a * 230, al = 1 - a, hue = wv.side === "buy" ? BUY : SELL;
+      const r = wv.mini ? 5 + a * a * 58 : 14 + a * a * 230;
+      const al = (1 - a) * (wv.mini ? 0.55 : 1), hue = wv.side === "buy" ? BUY : SELL;
       cx.save();
       cx.beginPath(); cx.rect(0, 0, plotW, cv.height); cx.clip();
-      cx.shadowColor = hue; cx.shadowBlur = 22 * al;
-      cx.strokeStyle = rgba(hue, 0.75 * al); cx.lineWidth = 2.2 * al + 0.4;
+      cx.shadowColor = hue; cx.shadowBlur = (wv.mini ? 10 : 22) * al;
+      cx.strokeStyle = rgba(hue, 0.75 * al); cx.lineWidth = (wv.mini ? 1.2 : 2.2) * al + 0.4;
       cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2); cx.stroke();
       cx.shadowBlur = 8 * al;
-      cx.strokeStyle = `rgba(255,255,255,${0.85 * al})`; cx.lineWidth = 0.7;
+      cx.strokeStyle = `rgba(255,255,255,${0.85 * al})`; cx.lineWidth = wv.mini ? 0.5 : 0.7;
       cx.beginPath(); cx.arc(x, y, r, 0, Math.PI * 2); cx.stroke();
-      cx.shadowBlur = 14; cx.fillStyle = `rgba(255,255,255,${al})`;
-      cx.beginPath(); cx.arc(x, y, 2.4, 0, Math.PI * 2); cx.fill();
+      if (!wv.mini) {
+        cx.shadowBlur = 14; cx.fillStyle = `rgba(255,255,255,${al})`;
+        cx.beginPath(); cx.arc(x, y, 2.4, 0, Math.PI * 2); cx.fill();
+      }
       cx.restore();
     }
     for (let i = scars.length - 1; i >= 0; i--) {
