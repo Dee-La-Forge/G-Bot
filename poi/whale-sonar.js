@@ -321,7 +321,7 @@
     const wm = document.getElementById("watermark");
     if (wm) {
       wm.style.left = visible ? "35px" : "";
-      wm.style.top = visible ? "127px" : "";
+      wm.style.top = visible ? "111px" : "";
       wm.style.bottom = visible ? "auto" : "";
     }
     btn.classList.toggle("on", visible);
@@ -351,9 +351,9 @@
       #gonWhaleCv { position:absolute; inset:0; pointer-events:none; z-index:6; }
       /* Radar autonome en HAUT A GAUCHE, sous la legende ATR ; le journal
          forme une colonne cockpit juste en dessous. Le logo reste intact. */
-      #gonWhaleRadar { position:absolute; left:12px; top:104px; width:130px; height:130px;
+      #gonWhaleRadar { position:absolute; left:12px; top:88px; width:130px; height:130px;
         pointer-events:auto; cursor:pointer; z-index:7; }
-      #gonWhaleLog { position:absolute; left:12px; top:240px; width:200px; z-index:7;
+      #gonWhaleLog { position:absolute; left:12px; top:224px; width:200px; z-index:7;
         pointer-events:none; font:11px "Segoe UI", sans-serif; }
       .gonWhEv { display:flex; align-items:center; gap:6px; padding:2px 0; color:#c9c4b4; }
       .gonWhEv i { width:5px; height:5px; border-radius:50%; flex:none; }
