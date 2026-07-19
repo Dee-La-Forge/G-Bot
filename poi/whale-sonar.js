@@ -170,7 +170,7 @@
     // orbite 44-58 : hors du logo (42), sous l'anneau externe (60)
     blips.push({ side, dim, born: performance.now(),
       r: dim ? 1.6 : Math.min(6, 2 + Math.log10(Math.max(1, usd / 1e5)) * 2.2),
-      ang: Math.random() * Math.PI * 2, dist: 44 + Math.random() * 14 });
+      ang: Math.random() * Math.PI * 2, dist: 44 + Math.random() * 18 });
     if (blips.length > 90) blips.shift();
   }
 
@@ -241,15 +241,15 @@
 
   // 130x130 centre (65,65) — le watermark G-Bot est deplace sous le radar
   // (applyVisible) : anneaux HORS du logo (rayon 42), il est le coeur.
-  const RC_X = 65, RC_Y = 65, R_MAX = 60;
+  const RC_X = 72, RC_Y = 72, R_MAX = 66;
   function drawRadar(now) {
     radarCx.setTransform(2, 0, 0, 2, 0, 0);
-    radarCx.clearRect(0, 0, 130, 130);
+    radarCx.clearRect(0, 0, 144, 144);
     const cxr = RC_X, cyr = RC_Y;
     radarCx.strokeStyle = "rgba(217,182,77,.34)"; radarCx.lineWidth = 1;
     radarCx.beginPath(); radarCx.arc(cxr, cyr, 43, 0, Math.PI * 2); radarCx.stroke();
     radarCx.strokeStyle = "rgba(217,182,77,.16)";
-    for (const rr of [52, R_MAX]) {
+    for (const rr of [54, R_MAX]) {
       radarCx.beginPath(); radarCx.arc(cxr, cyr, rr, 0, Math.PI * 2); radarCx.stroke();
     }
     sweepA += 0.014;
@@ -277,7 +277,7 @@
     radarCx.restore();
     radarCx.fillStyle = muted ? "rgba(110,106,88,.9)" : "rgba(217,182,77,.9)";
     radarCx.font = "9px Segoe UI";
-    radarCx.fillText(muted ? "♪ off" : "♪", 4, 126);
+    radarCx.fillText(muted ? "♪ off" : "♪", 4, 140);
   }
 
   /* ---------- son ---------- */
@@ -351,9 +351,9 @@
       #gonWhaleCv { position:absolute; inset:0; pointer-events:none; z-index:6; }
       /* Radar autonome en HAUT A GAUCHE, sous la legende ATR ; le journal
          forme une colonne cockpit juste en dessous. Le logo reste intact. */
-      #gonWhaleRadar { position:absolute; left:12px; top:88px; width:130px; height:130px;
+      #gonWhaleRadar { position:absolute; left:5px; top:81px; width:144px; height:144px;
         pointer-events:auto; cursor:pointer; z-index:7; }
-      #gonWhaleLog { position:absolute; left:12px; top:224px; width:200px; z-index:7;
+      #gonWhaleLog { position:absolute; left:12px; top:232px; width:200px; z-index:7;
         pointer-events:none; font:11px "Segoe UI", sans-serif; }
       .gonWhEv { display:flex; align-items:center; gap:6px; padding:2px 0; color:#c9c4b4; }
       .gonWhEv i { width:5px; height:5px; border-radius:50%; flex:none; }
@@ -368,7 +368,7 @@
     cv = document.createElement("canvas"); cv.id = "gonWhaleCv";
     cx = cv.getContext("2d");
     radarCv = document.createElement("canvas"); radarCv.id = "gonWhaleRadar";
-    radarCv.width = 260; radarCv.height = 260;
+    radarCv.width = 288; radarCv.height = 288;
     radarCx = radarCv.getContext("2d");
     journalEl = document.createElement("div"); journalEl.id = "gonWhaleLog";
     gon.mount.appendChild(cv); gon.mount.appendChild(radarCv); gon.mount.appendChild(journalEl);
