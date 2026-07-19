@@ -242,23 +242,23 @@
       cxCvd.lineTo(pts[pts.length - 1].x, y0); cxCvd.closePath();
       const grad = cxCvd.createLinearGradient(0, sign > 0 ? zTop : zBot, 0, y0);
       const hue = sign > 0 ? BUY : SELL;
-      grad.addColorStop(0, rgba(hue, 0.30));
-      grad.addColorStop(1, rgba(hue, 0.02));
+      grad.addColorStop(0, rgba(hue, 0.14));
+      grad.addColorStop(1, rgba(hue, 0.01));
       cxCvd.fillStyle = grad; cxCvd.fill();
     }
     cxCvd.setLineDash([4, 4]);
-    cxCvd.strokeStyle = "rgba(110,106,88,.35)"; cxCvd.lineWidth = 1;
+    cxCvd.strokeStyle = "rgba(110,106,88,.22)"; cxCvd.lineWidth = 1;
     cxCvd.beginPath(); cxCvd.moveTo(0, y0); cxCvd.lineTo(w - 58, y0); cxCvd.stroke();
     cxCvd.setLineDash([]);
     for (let i = 1; i < pts.length; i++) {
       const hue = pts[i].cvd >= pts[i - 1].cvd ? BUY : SELL;
-      cxCvd.shadowColor = hue; cxCvd.shadowBlur = 5;
-      cxCvd.strokeStyle = rgba(hue, 0.85); cxCvd.lineWidth = 1.2;
+      cxCvd.shadowColor = hue; cxCvd.shadowBlur = 2;
+      cxCvd.strokeStyle = rgba(hue, 0.45); cxCvd.lineWidth = 1;
       cxCvd.beginPath(); cxCvd.moveTo(pts[i - 1].x, yC(pts[i - 1].cvd));
       cxCvd.lineTo(pts[i].x, yC(pts[i].cvd)); cxCvd.stroke();
     }
     cxCvd.shadowBlur = 0;
-    cxCvd.fillStyle = "rgba(110,106,88,.8)"; cxCvd.font = "8px Segoe UI";
+    cxCvd.fillStyle = "rgba(110,106,88,.45)"; cxCvd.font = "8px Segoe UI";
     cxCvd.fillText("CVD 48h", 8, zTop + 11);
     cxCvd.restore();
   }
