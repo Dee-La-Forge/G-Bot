@@ -624,6 +624,7 @@ const volSeries = chart.addSeries(LWC.HistogramSeries, {
   priceScaleId: '', priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false,
 });
 volSeries.priceScale().applyOptions({ scaleMargins: { top: .85, bottom: 0 } });
+volSeries.applyOptions({ visible: false });   // histogramme volume masqué : seule la courbe ATR occupe la zone basse
 
 /* ---------- indicateur : ATR 233 lissé SMA (zone volume) ---------- */
 const IND_N = 233;
@@ -2537,6 +2538,6 @@ load();
 <script src="poi/poi-render.js?v=28"></script>
 <script src="poi/poi-feature.js?v=28"></script>
 <script src="poi/liq-flux.js?v=16"></script>
-<script src="poi/whale-sonar.js?v=3"></script>
+<script src="poi/whale-sonar.js?v=4"></script>
 </body>
 </html>
