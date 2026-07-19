@@ -292,7 +292,7 @@
       #gonLiqVideo { position:relative; margin-top:auto; }
       /* ecran agrandi : hauteur fixe + cover (recadre les bords au lieu
          d'ecraser l'image — la largeur du panneau ne bouge pas) */
-      #gonLiqVideo video { display:block; width:100%; height:170px; object-fit:cover;
+      #gonLiqVideo video { display:block; width:100%; height:187px; object-fit:cover;
         border-radius:0 0 5px 5px; }
       #gonLiqSnd { position:absolute; right:6px; bottom:8px; pointer-events:auto;
         background:rgba(10,10,8,.72); border:1px solid rgba(217,182,77,.3);
