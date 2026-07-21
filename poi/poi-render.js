@@ -451,11 +451,10 @@
 
     function paint() {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, cv.width, cv.height);
-      // Remis AVANT les early-returns : sinon la boucle pulse continue de
-      // repeindre un canvas masque/vide a ~30fps toute la session.
       hasEliteVisible = false;
-      if (!visible || (!pois.length && !prov)) return;
+      // Etat stable "rien a montrer" (masque / aucun POI) : on efface, c'est
+      // definitif tant que la vue ne change pas.
+      if (!visible || (!pois.length && !prov)) { ctx.clearRect(0, 0, cv.width, cv.height); return true; }
       let axisH = 0;
       try { axisH = (typeof gon.ts().height === "function" ? gon.ts().height() : 0) || 0; } catch (_) {}
       const paneH = Math.max(1, cv.height / dpr - axisH);
@@ -464,7 +463,13 @@
         const a = gon.series.coordinateToPrice(0), b = gon.series.coordinateToPrice(paneH);
         if (a != null && b != null) { pHi = Math.max(a, b); pLo = Math.min(a, b); }
       } catch (_) {}
-      if (!isFinite(pLo) || !isFinite(pHi)) return;
+      // Echelle de prix pas encore prete (transitoire pendant un zoom/pan/maj) :
+      // on NE VIDE PAS le canvas -> on garde la derniere image et on RETENTE au
+      // tick suivant. Sans ca, les zones s'effacent et ne reviennent qu'au
+      // prochain changement de vue ("par moment les zones s'effacent... au zoom
+      // elles reapparaissent"). Retour false = "echec transitoire".
+      if (!isFinite(pLo) || !isFinite(pHi)) return false;
+      ctx.clearRect(0, 0, cv.width, cv.height);   // on efface SEULEMENT quand on va redessiner
       const plotW = (typeof gon.ts().width === "function" ? gon.ts().width() : cv.width / dpr) || cv.width / dpr;
       const now = Date.now();
       // Battement MAXIMAL (~2 s, +/-80%) : au creux le halo elite retombe
@@ -527,6 +532,7 @@
       } finally {
         ctx.restore();
       }
+      return true;   // frame dessinee avec succes
     }
 
     // ✦ VALIDES — regle de retest (long sur trait bleu, short sur trait
@@ -600,11 +606,11 @@
         const now = performance.now();
         const pulseDue = hasEliteVisible && now - lastPulsePaint >= 33;
         if (forceDirty || sig !== lastSig || pulseDue) {
-          paint();
-          // commit APRES un paint reussi : une exception laisse l'etat dirty
-          // et la frame se retente au tick suivant au lieu de figer une frame
-          // partiellement dessinee.
-          forceDirty = false; lastSig = sig; lastPulsePaint = now;
+          // paint() renvoie false si l'echelle de prix n'etait pas prete
+          // (transitoire) : on GARDE l'etat dirty pour retenter au tick suivant
+          // au lieu de figer un canvas vide jusqu'au prochain changement de vue.
+          if (paint() !== false) { forceDirty = false; lastSig = sig; lastPulsePaint = now; }
+          else { forceDirty = true; }
         }
       } catch (error) {
         if (!tick.warned) { tick.warned = true; console.warn("[POI] erreur de rendu (boucle preservee)", error); }
