@@ -215,10 +215,17 @@
       const active = poi.status === "ACTIVE_UNTOUCHED";
       const endMs = active ? now : (poi.firstTouchTs ?? poi.statusChangedTs ?? now);
       let x2 = active ? plotW : gon.timeToX(snapToBarSec(endMs));
-      if (x2 == null || !isFinite(x2)) x2 = plotW;
+      if (active && (x2 == null || !isFinite(x2))) x2 = plotW;
+      // Niveau MORT : trait BORNE. Une queue pointillee qui se termine PILE sur
+      // la bougie de mort (x2) et remonte au plus DEAD_TAIL_PX vers la gauche
+      // (ou la naissance si plus proche). Fini le trait plein-ecran qui balaie
+      // toutes les bougies et le repli sur plotW (source des labels alignes).
+      if (!active && (x2 == null || !isFinite(x2))) return null;   // mort non placable -> rien (plus de repli plotW)
+      // MORT : le trait va de la bougie de DEPART (naissance, x1) a la bougie de
+      // FIN (mort, x2). Span REEL, borne a la mort (fini le repli plein-ecran).
       const left = Math.max(0, x1);
-      const right = Math.min(plotW, Math.max(x2, x1 + 2));
-      if (right <= 0 || left >= plotW) return null;
+      const right = active ? Math.min(plotW, Math.max(x2, x1 + 2)) : Math.min(plotW, x2);
+      if (right <= 0 || left >= plotW || right <= left) return null;
 
       const hue = HUE[poi.direction] || HUE.long;
       const y = yEntry != null ? yEntry : yOpp;
@@ -240,38 +247,46 @@
       laserHline(left, right, y, lw, hue, lineAlpha, dash, glowScale, elite);
 
       const ySnap = Math.round(y) + 0.5;
-      // Point d'ORIGINE (bougie source) : disque chaud + anneau de gainage
-      if (x1 >= 0 && x1 <= plotW) {
-        if (glowScale > 0) { ctx.shadowColor = rgba(hue, 0.9); ctx.shadowBlur = 10 * glowScale; }
-        ctx.beginPath(); ctx.arc(x1, ySnap, 2.5, 0, Math.PI * 2);
-        ctx.fillStyle = glowScale > 0 ? rgba(tint(hue, 0.45), lineAlpha) : rgba(hue, lineAlpha);
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        ctx.lineWidth = 1.5; ctx.strokeStyle = T.casing; ctx.stroke();
-      }
-      // Terminator de niveau MORT : tick vertical net "consomme ici" — UNIQUE
-      // et identique pour toutes les morts (plus de cercle distinct pour les
-      // touches : deux etats seulement, vivant / mort).
-      if (!active && x2 > 0 && x2 < plotW) {
-        ctx.save(); ctx.lineCap = "butt";
-        ctx.beginPath();
-        ctx.moveTo(Math.round(x2) + 0.5, ySnap - 3); ctx.lineTo(Math.round(x2) + 0.5, ySnap + 3);
-        ctx.strokeStyle = rgba(hue, T.lineDeadAlpha); ctx.lineWidth = 1; ctx.stroke();
-        ctx.restore();
+      const deadMarkA = T.lineDeadAlpha + 0.25;   // bouts un peu plus francs que le trait
+      if (active) {
+        // Point d'ORIGINE actif : disque chaud + anneau de gainage.
+        if (x1 >= 0 && x1 <= plotW) {
+          if (glowScale > 0) { ctx.shadowColor = rgba(hue, 0.9); ctx.shadowBlur = 10 * glowScale; }
+          ctx.beginPath(); ctx.arc(x1, ySnap, 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = glowScale > 0 ? rgba(tint(hue, 0.45), lineAlpha) : rgba(hue, lineAlpha);
+          ctx.fill(); ctx.shadowBlur = 0;
+          ctx.lineWidth = 1.5; ctx.strokeStyle = T.casing; ctx.stroke();
+        }
+      } else {
+        // MORT : marqueur aux DEUX bouts du trait, sur leurs bougies exactes.
+        // DEPART (naissance) = petit rond CREUX sur la bougie source.
+        if (x1 >= 0 && x1 <= plotW) {
+          ctx.beginPath(); ctx.arc(x1, ySnap, 3, 0, Math.PI * 2);
+          ctx.fillStyle = T.casing; ctx.fill();
+          ctx.lineWidth = 1.25; ctx.strokeStyle = rgba(hue, deadMarkA); ctx.stroke();
+        }
+        // FIN (mort) = tick vertical net "consomme ici" sur la bougie de mort.
+        if (x2 > 0 && x2 < plotW) {
+          ctx.save(); ctx.lineCap = "butt";
+          ctx.beginPath();
+          ctx.moveTo(Math.round(x2) + 0.5, ySnap - 4); ctx.lineTo(Math.round(x2) + 0.5, ySnap + 4);
+          ctx.strokeStyle = rgba(hue, deadMarkA); ctx.lineWidth = 1.25; ctx.stroke();
+          ctx.restore();
+        }
       }
 
       if (!Number.isFinite(poi.score) || !wantLabel) return null;
       const price = entryPrice != null ? entryPrice : oppPrice;
       // (elite est reporte sur le chip de droite via une pastille or)
       if (!active) {
-        // Niveaux NON-ACTIFS (touches + consommes) : label centre sur la ligne.
-        // La colonne de droite est reservee aux ACTIFS, et un prix deja etiquete
-        // au centre n'est PAS re-etiquete a droite (anti-doublon de prix).
-        // Pas de chip si le segment VISIBLE est plus court que lui : un label
-        // clampe au bord sans ligne dessous se lit comme un niveau "flottant".
+        // Niveaux MORTS : label CENTRE sur le niveau, au MILIEU de sa vie
+        // (naissance -> mort). Le centre = milieu de deux bougies FIXES, donc il
+        // glisse avec le graphe au scroll (stable). Si ce centre sort de l'ecran,
+        // on n'affiche pas le label (au lieu de le rabattre au bord = colonnes
+        // alignees, le defaut d'avant).
         const cw = chipWidth(price, poi.score);
-        if (right - left < cw + 8) return null;
-        const cx = Math.min(plotW - rightInset - cw / 2 - 2, Math.max(cw / 2 + 2, (left + right) / 2));
+        const cx = (x1 + x2) / 2;
+        if (cx < cw / 2 + 2 || cx > plotW - rightInset - cw / 2 - 2) return null;
         drawChip(Math.round(cx - cw / 2), Math.round(y - TAG_H / 2), price, poi.score, hue, "dead", cw);
         if (centeredPrices) centeredPrices.add(price);
         return null;
